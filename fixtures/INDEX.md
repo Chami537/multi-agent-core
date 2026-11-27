@@ -204,3 +204,5 @@ git diff --check
 其他并行任务可能正常更新其项目的 `runs.json`，所以不对整个活跃文件作静止承诺。
 采集只写当前分支的 `fixtures/`；按本任务“现网数据只读”的限定，没有调用会写入现网
 handoff、task report 或配置的命令。没有 push/merge。
+
+> 公开脱敏注记（2026-11-27）：转公开前，本机推理网关的回环端口已统一替换为 `<gateway-port>`（涉及 check.py 的 SAFE_ERRORS、runners/claude/retry-502.ndjson 共 5 处、及设计计划 R11）；manifest 中 retry-502 的 fixture_sha256 已同步更新为脱敏后哈希，源记录哈希不变，`--sources` 对该样本的比对差异为预期行为。

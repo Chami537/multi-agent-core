@@ -27,7 +27,7 @@ IDENTIFIERS = {
     "completionReason", "workflow",
 }
 SAFE_ERRORS = {
-    "API Error: 502 status code (no body). This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:15721).",
+    "API Error: 502 status code (no body). This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:<gateway-port>).",
     "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at 6:18 PM. [usageLimitExceeded]",
     "FAILED_PRECONDITION (code 400): User location is not supported for the API use.",
     "authentication failed or timed out",

@@ -9,15 +9,15 @@
 {"type":"text","text":"[REDACTED:TEXT]","stepId":"task","seq":9,"ts":"2026-11-26T05:29:34.581Z"}
 {"type":"turn.completed","turnId":"turn_1","stopReason":"end_turn","usage":{"input":0,"output":0,"total":0,"cacheRead":0,"cacheWrite":0},"costUsd":0,"stepId":"task","seq":10,"ts":"2026-11-26T05:29:34.603Z"}
 {"type":"usage.updated","usage":{"input":0,"output":0,"total":0,"cacheRead":0,"cacheWrite":0},"costUsd":0,"stepId":"task","seq":11,"ts":"2026-11-26T05:29:34.603Z"}
-{"type":"error","message":"API Error: 502 status code (no body). This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:15721).","stepId":"task","seq":12,"ts":"2026-11-26T05:29:34.604Z"}
+{"type":"error","message":"API Error: 502 status code (no body). This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:<gateway-port>).","stepId":"task","seq":12,"ts":"2026-11-26T05:29:34.604Z"}
 {"type":"cost","usd":0,"stepId":"task","seq":13,"ts":"2026-11-26T05:29:34.608Z"}
 {"type":"turn-end","stepId":"task","seq":14,"ts":"2026-11-26T05:29:34.608Z"}
 {"type":"note","message":"[REDACTED:TEXT]","stepId":"task","seq":15,"ts":"2026-11-26T05:29:34.623Z"}
 {"type":"done","stepId":"task","seq":16,"ts":"2026-11-26T05:29:34.625Z"}
-{"type":"session.error","message":"API Error: 502 status code (no body). This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:15721).","fatal":true,"stepId":"task","seq":17,"ts":"2026-11-26T05:29:34.627Z"}
-{"type":"session.ended","reason":"error","message":"API Error: 502 status code (no body). This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:15721).","stepId":"task","seq":18,"ts":"2026-11-26T05:29:34.628Z"}
-{"type":"step-end","stepId":"task","status":"failed","error":"API Error: 502 status code (no body). This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:15721).","seq":19,"ts":"2026-11-26T05:29:34.628Z"}
-{"type":"lifecycle","message":"run failed — step \"task\" failed: API Error: 502 status code (no body). This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:15721).","seq":20,"ts":"2026-11-26T05:29:34.658Z"}
+{"type":"session.error","message":"API Error: 502 status code (no body). This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:<gateway-port>).","fatal":true,"stepId":"task","seq":17,"ts":"2026-11-26T05:29:34.627Z"}
+{"type":"session.ended","reason":"error","message":"API Error: 502 status code (no body). This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:<gateway-port>).","stepId":"task","seq":18,"ts":"2026-11-26T05:29:34.628Z"}
+{"type":"step-end","stepId":"task","status":"failed","error":"API Error: 502 status code (no body). This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:<gateway-port>).","seq":19,"ts":"2026-11-26T05:29:34.628Z"}
+{"type":"lifecycle","message":"run failed — step \"task\" failed: API Error: 502 status code (no body). This is a server-side issue, usually temporary — try again in a moment. If it persists, check your inference gateway (127.0.0.1:<gateway-port>).","seq":20,"ts":"2026-11-26T05:29:34.658Z"}
 {"type":"lifecycle","message":"temporary provider failure — retrying automatically at Nov 26, 2026, 1:30:04 PM GMT+8 (1/2)","seq":21,"ts":"2026-11-26T05:29:34.734Z"}
 {"type":"lifecycle","message":"retrying after a temporary provider failure (1/2)","seq":22,"ts":"2026-11-26T05:30:03.916Z"}
 {"type":"lifecycle","message":"run resumed — workflow \"quick-task\" (runner: claude)","seq":23,"ts":"2026-11-26T05:30:03.932Z"}
