@@ -1,10 +1,14 @@
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Runtime, type RuntimeOptions } from '../../dist/core/runtime.js';
-import { alive, durableJson, signalGroup } from '../../dist/host/process.js';
+import { durableJson, signalProcess } from '../../dist/host/process.js';
 import type { Run, State } from '../../dist/core/types.js';
+import type { StartParams } from '../../dist/core/types.js';
+import { move } from '../../dist/core/lifecycle.js';
 
 export const allocations: { root: string; runtime: Runtime }[] = [];
 export function makeRuntime(options: Partial<RuntimeOptions> = {}): Runtime {
@@ -19,6 +23,14 @@ export async function markerPreserver(run: Readonly<Run>, kind: 'wip' | 'final')
 }
 export function workspace(runtime: Runtime): string { const path = join(runtime.root, 'workspace'); mkdirSync(path, { recursive: true }); return path; }
 export function prompt(scenario: unknown): string { return `\`\`\`mac-fake\n${typeof scenario === 'string' ? scenario : JSON.stringify(scenario)}\n\`\`\``; }
+export function launchFixture(rt: Runtime, mode: string): Run {
+  const r = rt.create({ workspace: workspace(rt) }); r.segment = 1;
+  r.intent = { runId: r.id, segment: 1, segmentKind: 'initial', launchToken: randomUUID(), daemonEpoch: rt.epoch, status: 'pending' };
+  rt.store.transaction(() => { move(r, 'running', null); rt.store.put(r); });
+  const start: StartParams = { run_id: r.id, segment: 1, prompt: { text: 'test', format: 'markdown' }, model: { id: 'fake-high' }, reasoning_effort: { effort: 'default', native: null }, interaction: 'autonomous', workspace: { cwd: r.workspace, read_only: false, artifacts_dir: r.runDir, scratch_dir: r.runDir, readonly_paths: [] }, limits: { max_steps: null, total_s: null, idle_s: null }, forbidden: [], resume: null, raw_dir: null, conformance: null };
+  rt.host.launch({ runDir: r.runDir, segment: 1, token: r.intent.launchToken, command: [process.execPath, resolve('tests/helpers/endpoint.mjs'), mode], cwd: r.workspace, env: {}, start });
+  return r;
+}
 export async function until(predicate: () => boolean | Promise<boolean>, ms = 5_000): Promise<void> {
   const end = Date.now() + ms;
   do { if (await predicate()) return; await delay(15); } while (Date.now() < end);
@@ -32,8 +44,8 @@ export async function cleanup(): Promise<void> {
     let runs: Run[] = []; try { runs = runtime.store.list(); } catch { /* Already closed. */ }
     for (const r of runs) {
       const s = runtime.host.status(r.runDir, r.segment);
-      if (s?.pgid) signalGroup(s.pgid, 'SIGKILL');
-      if (s && alive(s.shim)) { try { process.kill(s.shim.pid, 'SIGKILL'); } catch { /* Gone. */ } }
+      runtime.host.signal(r.runDir, r.segment, 'SIGKILL');
+      if (s) signalProcess(s.shim, 'SIGKILL');
     }
     runtime.close();
   }

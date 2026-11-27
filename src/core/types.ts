@@ -3,7 +3,7 @@ export const terminal = new Set<State>(['done', 'failed', 'cancelled', 'interrup
 export type InputMode = 'none' | 'stdin' | 'resume';
 export type Role = 'dev' | 'design' | 'review' | 'audit' | 'integrate';
 export type StopKind = 'cancel' | 'pause' | 'timeout' | 'guard' | 'budget';
-export interface StopRequest { kind: StopKind; requestedAt: number; linearizedAt: number; sentAt: number | null; preserveWip: boolean }
+export interface StopRequest { kind: StopKind; requestedAt: number; linearizedAt: number; sentAt: number | null; preserveWip: boolean; reason: string | null }
 export interface Usage {
   input_tokens: number | null; output_tokens: number | null;
   cache_read_tokens: number | null; cache_write_tokens: number | null;
@@ -25,7 +25,9 @@ export interface Finished {
   steps: number | null; turns: number | null; resume_token: string | null;
   native_session_id: string | null; native_exit: { code: number | null; signal: string | null } | null;
 }
-export interface Candidate { at: number; stopPrecedes: boolean; data: Finished }
+export interface Candidate { at: number; stopPrecedes: boolean; data: Finished; source: 'runner' | 'host' }
+export interface Timeouts { total_s: number | null; idle_s: number | null; waiting_s: number | null }
+export interface Clocks { totalMs: number; runningSince: number | null; idleSince: number | null; waitingSince: number | null }
 export interface Preservation { state: 'not_required' | 'pending' | 'saved' | 'failed'; kind: 'wip' | 'final' | null; error: string | null; sha: string | null }
 export interface LaunchIntent {
   runId: string; segment: number; segmentKind: 'initial' | 'launch_retry' | 'resume';
@@ -38,7 +40,8 @@ export interface Run {
   role: Role; model: string; reasoningEffort: string; reservation: boolean;
   segment: number; launchAttempts: number; intent: LaunchIntent | null;
   finalizing: boolean; stop: StopRequest | null; candidate: Candidate | null;
-  usage: Usage; previousSteps: number; protocolViolation: string | null;
+  usage: Usage & { unknown_runs: number }; segmentUsage: Record<string, Usage>; previousSteps: number; protocolViolation: string | null;
+  timeouts: Timeouts; clocks: Clocks;
   preservation: Preservation; protected: boolean; messages: Message[]; resumeToken: string | null;
   cleanupTermAt: number | null; outputDrained: boolean; groupEmpty: boolean;
   workspaceHead: string | null; hadWorkEvents: boolean;

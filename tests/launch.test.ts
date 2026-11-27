@@ -20,6 +20,7 @@ describe('T8 requires positive no-work proof',()=>{
   const r=rt.create({workspace:cwd,prompt:prompt({schema:'mac.fake-scenario/0.2',steps:[{op:'fail',error:{code:'auth_failed'},work_started:false}]})});
   for(let n=1;n<=4;n++){
    rt.start(r.id);const result=await state(rt,r.id,n===4?'failed':'queued');expect(result.segment).toBe(n);expect(result.launchAttempts).toBe(Math.min(n,3));
+   expect(result.previousSteps).toBe(n-1);expect(result.usage.steps).toBe(n);expect(Object.keys(result.segmentUsage)).toHaveLength(n);
   }
   expect(rt.store.get(r.id).reason).toBe('launch_failed');
  });

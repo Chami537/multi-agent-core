@@ -3,16 +3,18 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { resolve } from 'node:path';
 import { until } from './helpers/runtime.js';
+import { identity, signalProcess, type Identity } from '../dist/host/process.js';
 const children: ChildProcessWithoutNullStreams[]=[];
+const childIdentities = new Map<ChildProcessWithoutNullStreams, Identity>();
 function endpoint() {
-  const child=spawn(process.execPath,[resolve('dist/runners/fake.js')],{env:{MAC_SESSION_KIND:'control'}});children.push(child);
+  const child=spawn(process.execPath,[resolve('dist/runners/fake.js')],{env:{MAC_SESSION_KIND:'control'}});children.push(child);childIdentities.set(child,identity(child.pid!));
   let next=0;const replies=new Map<number,Record<string,any>>();const events:Record<string,any>[]=[];
   createInterface({input:child.stdout}).on('line',line=>{const f=JSON.parse(line);if(f.id!==undefined)replies.set(f.id,f);else events.push(f);});
   return {child,events,async rpc(method:string,params:unknown={}) {const id=++next;child.stdin.write(JSON.stringify({jsonrpc:'2.0',id,method,params})+'\n');await until(()=>replies.has(id));return replies.get(id)!;}};
 }
 const init={protocol_versions:['0.2'],host:{name:'test',version:'0.1.0',instance_id:'test'},session_kind:'control',conformance:false};
 const start={run_id:'test',segment:1,prompt:{text:'```mac-fake\ninteractive:2\n```',format:'markdown'},model:{id:'fake-high'},reasoning_effort:{effort:'default',native:null},interaction:'interactive',workspace:{cwd:process.cwd(),read_only:false,artifacts_dir:process.cwd(),scratch_dir:process.cwd(),readonly_paths:[]},limits:{max_steps:null,total_s:null,idle_s:null},forbidden:[],resume:null,raw_dir:null,conformance:null};
-afterEach(async()=>{for(const child of children){if(child.exitCode===null&&child.signalCode===null){child.kill('SIGKILL');await new Promise<void>(r=>child.once('close',()=>r()));}}children.length=0;});
+afterEach(async()=>{for(const child of children){if(child.exitCode===null&&child.signalCode===null){signalProcess(childIdentities.get(child)!,'SIGKILL');await new Promise<void>(r=>child.once('close',()=>r()));}}children.length=0;childIdentities.clear();});
 describe('fake endpoint protocol subset',()=>{
  it('requires initialize, negotiates 0.2 and exposes consistent capabilities',async()=>{
   const e=endpoint();expect((await e.rpc('capabilities')).error.code).toBe(-32002);expect((await e.rpc('initialize',init)).result.protocol_version).toBe('0.2');

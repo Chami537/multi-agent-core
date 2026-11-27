@@ -7,24 +7,31 @@ export class InvalidState extends Error {
   readonly code = 'invalid_state';
   constructor(readonly phase: string) { super(`invalid_state: ${phase}`); }
 }
-export function move(run: Run, to: State, reason: string | null, transition?: string): void {
+export function move(run: Run, to: State, reason: string | null, transition?: string, now = Date.now()): void {
   assertTransition(run.state, to, transition);
+  if (run.clocks.runningSince !== null) run.clocks.totalMs += Math.max(0, now - run.clocks.runningSince);
+  run.clocks.runningSince = to === 'running' ? now : null;
+  run.clocks.idleSince = to === 'running' ? now : null;
+  run.clocks.waitingSince = to === 'waiting' ? now : null;
   run.state = to; run.reason = reason; run.version++; run.reservation = occupiesSlot(run);
 }
-export function requestStop(run: Run, kind: StopKind, now: number, preserveWip = true): 'accepted' | 'queued' {
+export function requestStop(run: Run, kind: StopKind, now: number, preserveWip = false, reason: string | null = null): 'accepted' | 'queued' {
   if (['done', 'failed', 'cancelled', 'interrupted'].includes(run.state)) throw new InvalidState('terminal');
-  if (!run.stop && run.candidate && run.candidate.data.outcome !== 'awaiting_input') throw new InvalidState('finalizing');
+  if (!run.stop && run.finalizing && run.candidate?.data.outcome !== 'awaiting_input') throw new InvalidState('finalizing');
+  // Paused/queued receipts describe a previous segment, never an active finalizer.
+  if (!run.finalizing && !['running', 'waiting'].includes(run.state)) { run.candidate = null; run.stop = null; }
   if (!run.stop || (kind === 'cancel' && run.stop.kind !== 'cancel')) {
     // Keep the original sentAt: upgrading pause to cancel must not extend the grace period.
-    run.stop = { kind, requestedAt: now, linearizedAt: run.stop?.linearizedAt ?? now, sentAt: run.stop?.sentAt ?? null, preserveWip };
+    run.stop = { kind, requestedAt: now, linearizedAt: run.stop?.linearizedAt ?? now, sentAt: run.stop?.sentAt ?? null, preserveWip: kind === 'cancel' ? preserveWip : true, reason };
   }
   for (const m of run.messages) if (m.state === 'pending') m.state = 'invalidated';
   run.finalizing = true;
+  run.clocks.waitingSince = null;
   return run.candidate?.data.outcome === 'awaiting_input' ? 'queued' : 'accepted';
 }
-export function recordCandidate(run: Run, data: Finished, now: number): void {
+export function recordCandidate(run: Run, data: Finished, now: number, source: 'runner' | 'host' = 'runner'): void {
   if (run.candidate) { run.protocolViolation = 'multiple run.finished'; return; }
-  run.candidate = { data, at: now, stopPrecedes: run.stop !== null }; run.finalizing = true; run.resumeToken = data.resume_token;
+  run.candidate = { data, at: now, stopPrecedes: run.stop !== null, source }; run.finalizing = true; run.resumeToken = data.resume_token;
 }
 export type CleanupAction = 'none' | 'close_stdin' | 'send_stop' | 'sigterm' | 'sigkill';
 // Logical outcome and physical eviction are independent. All times are host commit/send times.
@@ -44,7 +51,7 @@ export function candidateOutcome(run: Run): { state: State; reason: string } {
   const stopFirst = run.stop && (!run.candidate || run.candidate.stopPrecedes);
   if (stopFirst) {
     if (run.stop!.kind === 'cancel') return { state: 'cancelled', reason: 'supervisor_cancel' };
-    return run.stop!.kind === 'timeout' ? { state: 'interrupted', reason: 'timeout_total' }
+    return run.stop!.kind === 'timeout' ? { state: 'interrupted', reason: run.stop!.reason ?? 'timeout_total' }
       : { state: 'paused', reason: { pause: 'supervisor_pause', guard: 'memory_limit', budget: 'budget_exceeded' }[run.stop!.kind] ?? 'supervisor_pause' };
   }
   if (run.protocolViolation) return { state: 'failed', reason: 'protocol_violation' };
@@ -55,14 +62,14 @@ export function candidateOutcome(run: Run): { state: State; reason: string } {
   if (d.outcome === 'cancelled') return { state: 'interrupted', reason: 'runner_crash' };
   const code = d.error?.code ?? 'runner_internal';
   if (code === 'step_limit_reached') return { state: 'paused', reason: code };
-  if (['runner_crash', 'recovery_failed', 'auth_failed', 'gateway_unavailable', 'quota_exhausted', 'upstream_unavailable', 'region_restricted'].includes(code)) return { state: 'interrupted', reason: code };
+  if (['runner_crash', 'host_restart', 'recovery_failed', 'auth_failed', 'gateway_unavailable', 'quota_exhausted', 'upstream_unavailable', 'region_restricted'].includes(code)) return { state: 'interrupted', reason: code };
   return { state: 'failed', reason: code };
 }
-export function finalize(run: Run, deliverablesValid = true): void {
+export function finalize(run: Run, deliverablesValid = true, now = Date.now()): void {
   if (!run.outputDrained || !run.groupEmpty) throw new Error('finalization_not_drained');
   const choice = candidateOutcome(run);
   if (choice.state === 'waiting') {
-    move(run, 'waiting', choice.reason); run.candidate = null; run.finalizing = !!run.stop;
+    move(run, 'waiting', choice.reason, undefined, now); run.candidate = null; run.finalizing = !!run.stop;
     if (run.intent) run.intent.status = 'ended';
     return;
   }
@@ -72,6 +79,6 @@ export function finalize(run: Run, deliverablesValid = true): void {
     choice.reason = 'preservation_failed';
     if (choice.state !== 'cancelled') choice.state = choice.state === 'done' ? 'failed' : 'interrupted';
   } else if (choice.state === 'done' && !deliverablesValid) { choice.state = 'failed'; choice.reason = 'deliverable_invalid'; }
-  move(run, choice.state, choice.reason); run.finalizing = false;
+  move(run, choice.state, choice.reason, undefined, now); run.finalizing = false;
   if (run.intent) run.intent.status = 'ended';
 }

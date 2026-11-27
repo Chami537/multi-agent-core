@@ -3,12 +3,13 @@ import { spawnSync } from 'node:child_process';
 import { dirname } from 'node:path';
 
 export interface Identity { pid: number; start: string; boot: string }
+export interface GroupIdentity { leader: Identity; members: Identity[] }
 export function bootId(): string { return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(); }
-export function processInfo(pid: number): { state: string; group: number; start: string } | null {
+export function processInfo(pid: number): { state: string; group: number; session: number; start: string } | null {
   try {
     const raw = readFileSync(`/proc/${pid}/stat`, 'utf8');
     const fields = raw.slice(raw.lastIndexOf(')') + 2).split(' ');
-    return { state: fields[0]!, group: Number(fields[2]), start: fields[19]! };
+    return { state: fields[0]!, group: Number(fields[2]), session: Number(fields[3]), start: fields[19]! };
   } catch { return null; }
 }
 export function identity(pid: number): Identity {
@@ -22,9 +23,37 @@ export function alive(who: Identity | null): boolean {
 export function groupAlive(pgid: number): boolean {
   return readdirSync('/proc').some(s => /^\d+$/.test(s) && (() => { const p = processInfo(Number(s)); return p?.group === pgid && p.state !== 'Z'; })());
 }
-export function signalGroup(pgid: number, signal: NodeJS.Signals): void {
+// The shim records members while it owns the child. Surviving members witness the
+// original group after its leader is reaped; a reused leader PID always vetoes it.
+export function groupMembers(leader: Identity): Identity[] {
+  if (leader.boot !== bootId()) return [];
+  const currentLeader = processInfo(leader.pid);
+  if (currentLeader && (currentLeader.start !== leader.start || currentLeader.group !== leader.pid || currentLeader.session !== leader.pid)) return [];
+  return readdirSync('/proc').filter(s => /^\d+$/.test(s)).flatMap(s => {
+    const pid = Number(s), p = processInfo(pid);
+    return p && p.group === leader.pid && p.session === leader.pid && BigInt(p.start) >= BigInt(leader.start) && p.state !== 'Z' ? [{ pid, start: p.start, boot: leader.boot }] : [];
+  });
+}
+export function ownsGroup(group: GroupIdentity | null): boolean {
+  if (!group || group.leader.boot !== bootId()) return false;
+  const leader = processInfo(group.leader.pid);
+  if (leader && (leader.start !== group.leader.start || leader.group !== group.leader.pid || leader.session !== group.leader.pid)) return false;
+  return [group.leader, ...group.members].some(who => {
+    const p = processInfo(who.pid);
+    return alive(who) && p?.group === group.leader.pid && p.session === group.leader.pid;
+  });
+}
+export function signalGroup(group: GroupIdentity, signal: NodeJS.Signals): boolean {
+  const pgid = group.leader.pid;
   if (pgid <= 1 || pgid === process.pid) throw new Error('unsafe_process_group');
+  if (!ownsGroup(group)) return false;
   try { process.kill(-pgid, signal); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ESRCH') throw e; }
+  return true;
+}
+export function signalProcess(who: Identity, signal: NodeJS.Signals): boolean {
+  if (!alive(who)) return false;
+  try { process.kill(who.pid, signal); } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ESRCH') throw e; }
+  return true;
 }
 // flock shares the open-file description with this process; fd remains locked after the helper exits.
 export function tryLock(path: string): (() => void) | null {

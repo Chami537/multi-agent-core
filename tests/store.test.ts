@@ -41,6 +41,15 @@ describe('SQLite event transaction and NDJSON recovery',()=>{
     store.db.exec("CREATE TRIGGER fail_event BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'disk failure'); END");
     expect(()=>ingest(store,r.id,path)).toThrow('disk failure'); expect(cursor(store,r.id,1).offset).toBe(0); expect(store.get(r.id).protocolViolation).toBeNull();
   });
+  it('budget stop, versioned event, usage and cursor roll back together and replay once',()=>{
+    const {store,r,path}=fixture();r.maxSteps=0;store.transaction(()=>store.put(r));
+    writeFileSync(path,start()+frame(2,'run.finished',finished({...emptyUsage(),steps:1})));const high=store.meta().high;
+    store.db.exec("CREATE TRIGGER reject_stop BEFORE INSERT ON events WHEN json_extract(NEW.payload,'$.type')='run.stop_requested' BEGIN SELECT RAISE(ABORT, 'stop event failure'); END");
+    expect(()=>ingest(store,r.id,path)).toThrow('stop event failure');expect(cursor(store,r.id,1).offset).toBe(0);expect(store.get(r.id).stop).toBeNull();expect(store.get(r.id).usage.steps).toBeNull();expect(store.meta().high).toBe(high);
+    store.db.exec('DROP TRIGGER reject_stop');ingest(store,r.id,path);
+    expect(store.get(r.id).candidate?.stopPrecedes).toBe(true);const events=store.eventsSince(0,1000).events.filter(e=>e.type==='run.stop_requested');expect(events).toHaveLength(1);expect(events[0]?.data.version).toBeTypeOf('number');
+    ingest(store,r.id,path);expect(store.eventsSince(0,1000).events.filter(e=>e.type==='run.stop_requested')).toHaveLength(1);
+  });
   it('deduplicates after cursor rewind even after finished, without extra usage/events',()=>{
     const {store,r,path}=fixture(); writeFileSync(path,start()+usage()+frame(3,'run.finished',finished({...emptyUsage(),input_tokens:10,steps:1})));
     ingest(store,r.id,path); const high=store.meta().high;

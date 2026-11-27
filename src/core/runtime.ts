@@ -13,7 +13,8 @@ import { decide, type Snapshot } from './decide.js';
 import { candidateOutcome, cleanupAction, defaultTiming, finalize, move, recordCandidate, requestStop, type Timing } from './lifecycle.js';
 import { assertTransition, isTerminal } from './state-machine.js';
 import { unsupported } from './unsupported.js';
-import { emptyUsage, type Finished, type InputMode, type Preservation, type Role, type Run, type StartParams, type StopKind } from './types.js';
+import { aggregateUsage } from './usage.js';
+import { emptyUsage, type Finished, type InputMode, type Preservation, type Role, type Run, type StartParams, type StopKind, type Timeouts } from './types.js';
 
 export type Preserver = (run: Readonly<Run>, kind: 'wip' | 'final') => Promise<Preservation>;
 export interface RuntimeOptions {
@@ -24,6 +25,7 @@ export interface CreateRun {
   inputMode?: InputMode; role?: Role; model?: string; reasoningEffort?: string;
   // Internal fake harness limit; D1 does not expose public Supervisor budget fields.
   fakeMaxSteps?: number | null;
+  timeouts?: Partial<Timeouts>;
 }
 export class Runtime {
   readonly store: Store;
@@ -45,13 +47,15 @@ export class Runtime {
     } catch (error) { release(); throw error; }
   }
   create(options: CreateRun): Run {
-    const allowed = ['id','projectId','taskId','account','workspace','prompt','inputMode','role','model','reasoningEffort','fakeMaxSteps'];
+    const allowed = ['id','projectId','taskId','account','workspace','prompt','inputMode','role','model','reasoningEffort','fakeMaxSteps','timeouts'];
     for (const key of Object.keys(options)) if (!allowed.includes(key)) unsupported(key, ['budget', 'max_steps'].includes(key) ? 'Phase 3' : 'D2 or later');
     if (options.role && !['dev', 'design'].includes(options.role)) unsupported(`role:${options.role}`, 'Phase 4');
     if (options.model && options.model !== 'fake-high') throw new Error('MODEL_UNAVAILABLE');
     if (options.reasoningEffort && !['default','low','medium','high'].includes(options.reasoningEffort)) throw new Error('EFFORT_UNSUPPORTED');
     if (options.inputMode !== undefined && !['none','stdin','resume'].includes(options.inputMode)) throw new Error('invalid_input_mode');
     if (options.fakeMaxSteps != null && (!Number.isSafeInteger(options.fakeMaxSteps) || options.fakeMaxSteps < 0)) throw new Error('invalid_step_limit');
+    const timeouts: Timeouts = { total_s: null, idle_s: null, waiting_s: null, ...options.timeouts };
+    if (Object.entries(timeouts).some(([key, value]) => !['total_s','idle_s','waiting_s'].includes(key) || (value !== null && (typeof value !== 'number' || !Number.isFinite(value) || value < 0)))) throw new Error('invalid_timeouts');
     if (options.prompt !== undefined && (typeof options.prompt !== 'string' || Buffer.byteLength(options.prompt) > 900 * 1024)) throw new Error('invalid_prompt');
     if (options.account !== undefined && !/^[\w-]+$/.test(options.account)) throw new Error('invalid_account');
     if (!existsSync(options.workspace) || !statSync(options.workspace).isDirectory()) throw new Error('invalid_workspace');
@@ -63,7 +67,7 @@ export class Runtime {
     const run: Run = { id, projectId: options.projectId ?? 'default', taskId: options.taskId ?? 'default', account: options.account ?? 'fake', runner: 'fake',
       state: 'queued', reason: null, version: 1, inputMode: options.inputMode ?? 'none', role: options.role ?? 'dev', model: options.model ?? 'fake-high', reasoningEffort: options.reasoningEffort ?? 'default',
       reservation: false, segment: 0, launchAttempts: 0, intent: null, finalizing: false, stop: null, candidate: null,
-      usage: emptyUsage(), previousSteps: 0, protocolViolation: null, preservation: { state: 'not_required', kind: null, error: null, sha: null }, protected: false, messages: [], resumeToken: null,
+      usage: aggregateUsage({}), segmentUsage: {}, previousSteps: 0, protocolViolation: null, timeouts, clocks: { totalMs: 0, runningSince: null, idleSince: null, waitingSince: null }, preservation: { state: 'not_required', kind: null, error: null, sha: null }, protected: false, messages: [], resumeToken: null,
       cleanupTermAt: null, outputDrained: false, groupEmpty: false, workspaceHead: null, hadWorkEvents: false, workspace: resolve(options.workspace), runDir, prompt: options.prompt ?? '', maxSteps: options.fakeMaxSteps ?? null };
     assertTransition(null, 'queued', 'T1');
     this.store.transaction(() => { this.store.put(run); this.store.emit('run.created', { run, version: run.version }, run); stateEvent(this.store, run, null, Date.now()); });
@@ -77,10 +81,16 @@ export class Runtime {
       return { id: run.id, state: run.state, inputMode: run.inputMode, reservation: run.reservation, projectId: run.projectId, account: run.account,
         intent: run.intent, intentConfirmed: run.intent?.status === 'spawned', shimAlive: facts?.shimAlive ?? false, groupAlive: facts?.groupAlive ?? false,
         pendingMessages: run.messages.filter(m => m.state === 'pending').length, lease: 'none' as const,
-        budgetRemaining: run.maxSteps === null || run.previousSteps + (run.usage.steps ?? 0) < run.maxSteps,
-        deadlines: { total: null, idle: null, waiting: null }, finalizing: run.finalizing, stopping: !!run.stop };
+        budgetRemaining: run.maxSteps === null || (run.usage.steps ?? 0) < run.maxSteps,
+        deadlines: this.deadlines(run), finalizing: run.finalizing, stopping: !!run.stop };
     });
     return { runs, globalLimit: this.options.globalLimit ?? 1, projectLimits: {}, accounts };
+  }
+  private deadlines(run: Run): { total: number | null; idle: number | null; waiting: number | null } {
+    const { clocks: c, timeouts: t } = run;
+    return { total: run.state === 'running' && c.runningSince !== null && t.total_s !== null ? c.runningSince + t.total_s * 1000 - c.totalMs : null,
+      idle: run.state === 'running' && c.idleSince !== null && t.idle_s !== null ? c.idleSince + t.idle_s * 1000 : null,
+      waiting: run.state === 'waiting' && c.waitingSince !== null && t.waiting_s !== null ? c.waitingSince + t.waiting_s * 1000 : null };
   }
   start(id: string, now = Date.now()): void {
     const eligible = decide(this.snapshot(), now).some(d => d.runId === id && ['start', 'deliver_input'].includes(d.action));
@@ -93,13 +103,13 @@ export class Runtime {
     const message = r.messages.find(m => m.state === 'pending');
     this.store.transaction(() => {
       const from = r.state;
-      if (isResume) r.previousSteps += r.usage.steps ?? 0;
+      r.previousSteps = r.usage.steps ?? 0;
       r.segment++; r.intent = { runId: r.id, segment: r.segment, segmentKind: isResume ? 'resume' : r.launchAttempts ? 'launch_retry' : 'initial', launchToken: randomUUID(), daemonEpoch: this.epoch, status: 'pending' };
-      r.candidate = null; r.stop = null; r.finalizing = false; r.cleanupTermAt = null; r.usage = emptyUsage(); r.protocolViolation = null;
+      r.candidate = null; r.stop = null; r.finalizing = false; r.cleanupTermAt = null; r.segmentUsage[r.segment] = emptyUsage(); r.usage = aggregateUsage(r.segmentUsage); r.protocolViolation = null;
       r.workspaceHead = workspaceBefore.head; r.hadWorkEvents = false;
       r.outputDrained = false; r.groupEmpty = false; r.preservation = { state: 'not_required', kind: null, error: null, sha: null };
       if (isResume && message) message.state = 'delivered';
-      move(r, 'running', null, isResume ? 'T10' : 'T5'); this.store.put(r); stateEvent(this.store, r, from, now);
+      move(r, 'running', null, isResume ? 'T10' : 'T5', now); this.store.put(r); stateEvent(this.store, r, from, now);
       this.store.activity(r, r.segment, 'mac.segment_started', { intent: r.intent });
     });
     const artifacts = join(r.runDir, 'artifacts'), scratch = join(r.runDir, 'scratch'), home = join(this.root, 'accounts', r.account);
@@ -107,7 +117,7 @@ export class Runtime {
     const native = ({ default: null, low: 'l', medium: 'm', high: 'h' } as Record<string, string | null>)[r.reasoningEffort] ?? null;
     const start: StartParams = { run_id: id, segment: r.segment, prompt: { text: r.prompt, format: 'markdown' }, model: { id: r.model }, reasoning_effort: { effort: r.reasoningEffort, native },
       interaction: r.inputMode === 'none' ? 'autonomous' : 'interactive', workspace: { cwd: r.workspace, read_only: false, artifacts_dir: artifacts, scratch_dir: scratch, readonly_paths: [] },
-      limits: { max_steps: r.maxSteps === null ? null : r.maxSteps - r.previousSteps, total_s: null, idle_s: null }, forbidden: [],
+      limits: { max_steps: r.maxSteps === null ? null : r.maxSteps - r.previousSteps, total_s: r.timeouts.total_s === null ? null : Math.max(0, r.timeouts.total_s - r.clocks.totalMs / 1000), idle_s: r.timeouts.idle_s }, forbidden: [],
       resume: isResume && message && r.resumeToken ? { token: r.resumeToken, input: { input_id: message.id, text: message.text }, usage_baseline: null } : null,
       raw_dir: null, conformance: null };
     this.host.launch({ runDir: r.runDir, segment: r.segment, token: r.intent!.launchToken,
@@ -120,14 +130,14 @@ export class Runtime {
       if (r.state !== 'waiting' || r.stop || r.finalizing) throw new Error('invalid_message_state');
       const existing = r.messages.find(m => m.id === messageId);
       if (existing) { if (existing.text !== text) throw new Error('input_conflict'); return; }
-      r.messages.push({ id: messageId, text, state: 'pending' }); r.version++; this.store.put(r);
+      r.messages.push({ id: messageId, text, state: 'pending' }); r.clocks.waitingSince = null; r.version++; this.store.put(r);
       this.store.emit('run.updated', { version: r.version, changes: { message: messageId } }, r);
     });
   }
   private deliverStdin(r: Run, now: number): void {
     const message = r.messages.find(m => m.state === 'pending'); if (!message) throw new Error('no_pending_message');
     this.store.transaction(() => {
-      message.state = 'dispatching'; move(r, 'running', null, 'T10'); this.store.put(r); stateEvent(this.store, r, 'waiting', now);
+      message.state = 'dispatching'; move(r, 'running', null, 'T10', now); this.store.put(r); stateEvent(this.store, r, 'waiting', now);
       this.store.activity(r, r.segment, 'mac.input', { input_id: message.id });
       this.store.db.prepare('INSERT INTO commands(run_id,segment,command_id,method,params) VALUES (?,?,?,?,?)')
         .run(r.id,r.segment,`input:${message.id}`,'run.input',JSON.stringify({ input_id: message.id, text: message.text }));
@@ -140,35 +150,59 @@ export class Runtime {
       this.host.command(run.runDir,run.segment,{ kind:'rpc', id:row.command_id as string, method:row.method as string, params:JSON.parse(row.params as string) as Record<string, unknown> });
     }
   }
-  stop(id: string, kind: StopKind = 'cancel', now = Date.now(), preserveWip = true): void {
+  stop(id: string, kind: StopKind = 'cancel', now = Date.now(), preserveWip = false, reason: string | null = null): void {
     this.store.transaction(() => {
-      const r = this.store.get(id); requestStop(r, kind, now, preserveWip); r.version++; this.store.put(r);
+      const r = this.store.get(id);
+      const processlessCancel = kind === 'cancel' && !preserveWip && r.state === 'waiting' && r.inputMode === 'resume' && !r.finalizing;
+      requestStop(r, kind, now, preserveWip, reason); r.version++;
       this.store.emit('run.stop_requested', { stop_request: r.stop, version: r.version }, r, now);
+      if (!['running','waiting'].includes(r.state) || processlessCancel) {
+        const from = r.state; r.outputDrained = r.groupEmpty = true; finalize(r, true, now); stateEvent(this.store, r, from, now);
+        this.store.emit('run.result', { version: r.version, preservation: r.preservation, reason: r.reason }, r, now);
+      }
+      this.store.put(r);
     });
   }
   complete(id: string): void {
-    const r = this.store.get(id);
-    if (r.state !== 'waiting' || r.stop || r.finalizing) throw new Error('invalid_complete_state');
-    if (r.inputMode === 'stdin') {
-      this.store.transaction(() => this.store.db.prepare('INSERT OR IGNORE INTO commands(run_id,segment,command_id,method,params) VALUES (?,?,?,?,?)').run(r.id,r.segment,'complete','run.complete','{}'));
-      this.flushCommands(r);
-    }
-    else this.store.transaction(() => { recordCandidate(r, this.syntheticFinished('completed', null, r), Date.now()); this.store.put(r); });
+    const r = this.store.transaction(() => {
+      const r = this.store.get(id);
+      if (r.state !== 'waiting' || r.stop || r.finalizing) throw new Error('invalid_complete_state');
+      if (r.inputMode === 'stdin') this.store.db.prepare('INSERT INTO commands(run_id,segment,command_id,method,params) VALUES (?,?,?,?,?)').run(r.id,r.segment,'complete','run.complete','{}');
+      else recordCandidate(r, this.syntheticFinished('completed', null, r), Date.now(), 'host');
+      r.finalizing = true; r.clocks.waitingSince = null;
+      for (const m of r.messages) if (m.state === 'pending') m.state = 'invalidated';
+      r.version++; this.store.put(r); this.store.emit('run.updated', { version: r.version, changes: { finalizing: true } }, r);
+      return r;
+    });
+    if (r.inputMode === 'stdin') this.flushCommands(r);
   }
   private syntheticFinished(outcome: Finished['outcome'], code: string | null, r: Run): Finished {
-    return { outcome, error: code ? { code } : null, work_started: true, final_message: null, usage: r.usage, model: {}, reasoning_effort: {}, steps: r.usage.steps, turns: r.usage.turns, resume_token: null, native_session_id: null, native_exit: null };
+    const usage = r.segmentUsage[r.segment] ?? emptyUsage();
+    return { outcome, error: code ? { code } : null, work_started: true, final_message: null, usage, model: {}, reasoning_effort: {}, steps: usage.steps, turns: usage.turns, resume_token: null, native_session_id: null, native_exit: null };
   }
   async recover(): Promise<void> {
     for (const r of this.store.list()) {
       if (!['running','waiting'].includes(r.state)) continue;
       if (this.hostRestart) {
+        if (r.state === 'waiting' && r.inputMode === 'resume' && !r.finalizing && !r.stop && !r.candidate) continue;
         // Host restart is modeled after all old processes are gone. No PID from a prior boot is signalled.
+        const protocol = join(this.host.directory(r.runDir, r.segment), 'protocol.ndjson');
+        if (r.segment && existsSync(protocol)) ingest(this.store, r.id, protocol);
+        const recovered = this.store.get(r.id);
         this.store.transaction(() => {
-          r.stop = null; r.candidate = null; r.finalizing = true; r.outputDrained = true; r.groupEmpty = true;
-          recordCandidate(r, this.syntheticFinished('failed', 'host_restart', r), Date.now());
-          r.preservation = { state: 'pending', kind: 'wip', error: null, sha: null }; this.store.put(r);
+          recovered.outputDrained = true; recovered.groupEmpty = true;
+          this.store.emit('alert', { kind: 'host_restart', run_id: recovered.id }, recovered);
+          if (!recovered.stop && !recovered.candidate) recordCandidate(recovered, this.syntheticFinished('failed', 'host_restart', recovered), Date.now(), 'host');
+          if (candidateOutcome(recovered).state === 'waiting') {
+            const from = recovered.state; finalize(recovered); stateEvent(this.store, recovered, from, Date.now());
+          }
+          this.store.put(recovered);
         });
-        await this.preserveAndFinalize(r.id, 'wip', { state: 'interrupted', reason: 'host_restart' }); continue;
+        if (recovered.state === 'waiting' && !recovered.stop && !recovered.candidate) continue;
+        if (recovered.stop?.kind === 'cancel' && !recovered.stop.preserveWip) {
+          this.store.transaction(() => { const from = recovered.state; finalize(recovered); this.store.put(recovered); stateEvent(this.store, recovered, from, Date.now()); });
+        } else await this.preserveAndFinalize(r.id, candidateOutcome(recovered).state === 'done' ? 'final' : 'wip');
+        continue;
       }
       if (!r.intent || r.intent.status === 'ended') continue;
       const fence = this.host.fenceMissing(r.runDir, r.intent);
@@ -189,17 +223,15 @@ export class Runtime {
       }
     }
   }
-  private async preserveAndFinalize(id: string, kind: 'wip' | 'final', override?: { state: Run['state']; reason: string }): Promise<void> {
+  private async preserveAndFinalize(id: string, kind: 'wip' | 'final', now = Date.now()): Promise<void> {
     let r = this.store.get(id);
     let result: Preservation;
     try { result = await this.options.preserve(r, kind); }
     catch (error) { result = { state: 'failed', kind, sha: null, error: String(error) }; }
     this.store.transaction(() => {
       r = this.store.get(id); const from = r.state; r.preservation = result;
-      if (override) {
-        r.protected = result.state === 'failed'; move(r, override.state, result.state === 'failed' ? 'preservation_failed' : override.reason); r.finalizing = false; if (r.intent) r.intent.status = 'ended';
-      } else finalize(r);
-      this.store.put(r); stateEvent(this.store, r, from, Date.now());
+      finalize(r, true, now);
+      this.store.put(r); stateEvent(this.store, r, from, now);
       this.store.emit('run.result', { version: r.version, preservation: result, reason: r.reason }, r);
       if (result.state === 'failed') this.store.emit('alert', { kind: 'preservation_failed', error: result.error }, r);
       if (kind === 'wip' && result.state === 'saved') this.store.activity(r, r.segment, 'mac.wip_committed', { sha: result.sha });
@@ -207,7 +239,17 @@ export class Runtime {
   }
   async tick(now = Date.now()): Promise<void> {
     if (this.closed || this.ticking) throw new Error('runtime_closed_or_busy'); this.ticking = true;
-    try { for (const r of this.store.list()) if (!isTerminal(r.state) && r.state !== 'paused') await this.tickRun(r.id, 'runner_crash', now); }
+    try {
+      // Consume durable output first: an already committed candidate must win over a later clock check.
+      for (const r of this.store.list()) if (!isTerminal(r.state) && r.state !== 'paused') await this.tickRun(r.id, 'runner_crash', now);
+      for (const decision of decide(this.snapshot(), now)) {
+        if (decision.action !== 'timeout' && decision.action !== 'pause_budget') continue;
+        const r = this.store.get(decision.runId);
+        const clock = Object.entries(this.deadlines(r)).find(([, at]) => at !== null && now >= at)?.[0] ?? 'total';
+        this.stop(r.id, decision.action === 'timeout' ? 'timeout' : 'budget', now, false, decision.action === 'timeout' ? `timeout_${clock}` : null);
+        if (['running','waiting'].includes(this.store.get(r.id).state)) await this.tickRun(r.id, 'runner_crash', now);
+      }
+    }
     finally { this.ticking = false; }
   }
   private async tickRun(id: string, crashCode = 'runner_crash', now = Date.now()): Promise<void> {
@@ -220,20 +262,30 @@ export class Runtime {
     if (facts.shimAlive && r.intent?.status === 'pending') this.store.transaction(() => { r.intent!.status = 'spawned'; this.store.put(r); });
     if (facts.shimAlive) this.flushCommands(r);
     if (!r.stop && !r.candidate && !r.protocolViolation && facts.shimAlive && !facts.status?.endpointExited) return;
-    if (r.protocolViolation && !r.candidate) this.store.transaction(() => { recordCandidate(r, this.syntheticFinished('failed', 'protocol_violation', r), now); this.store.put(r); });
-    if (!facts.endpointAlive && !facts.shimAlive && r.state === 'running' && !r.candidate && !r.stop) {
+    if (r.protocolViolation && !r.candidate) this.store.transaction(() => { recordCandidate(r, this.syntheticFinished('failed', 'protocol_violation', r), now, 'host'); this.store.put(r); });
+    const ownsEndpoint = r.state === 'running' || (r.state === 'waiting' && r.inputMode === 'stdin');
+    if (!facts.endpointAlive && (!facts.shimAlive || facts.status?.endpointExited) && ownsEndpoint && !r.candidate && !r.stop) {
       // A segment still being fenced/launched is reconciled by recover(), not treated as an immediate crash.
       if (!existsSync(directory) || (crashCode !== 'recovery_failed' && r.intent?.status === 'pending' && !this.host.launchRecord(r.runDir,r.segment))) return;
-      this.store.transaction(() => { recordCandidate(r, this.syntheticFinished('failed', crashCode, r), now); this.store.put(r); });
+      this.store.transaction(() => { recordCandidate(r, this.syntheticFinished('failed', crashCode, r), now, 'host'); this.store.put(r); });
     }
     if (r.candidate || r.stop) {
-      const action = cleanupAction(r, now, facts.endpointAlive, facts.groupAlive, this.timing);
+      const cancel = facts.status?.cancel;
+      if (r.stop && r.stop.sentAt === null && facts.status?.stopSentAt != null) {
+        this.store.transaction(() => { r.stop!.sentAt = facts.status!.stopSentAt; this.store.activity(r, r.segment, 'mac.stop_sent', { at: r.stop!.sentAt }); this.store.put(r); });
+      }
+      const timing = cancel ? { ...this.timing, graceMs: cancel.grace_s * 1000 } : this.timing;
+      const action = cleanupAction(r, now, facts.endpointAlive, facts.groupAlive, timing);
+      if (r.stop && r.candidate?.source === 'runner' && facts.shimAlive) this.host.command(r.runDir, r.segment, { kind: 'close' });
       if (action === 'close_stdin' && facts.shimAlive) this.host.command(r.runDir, r.segment, { kind: 'close' });
       if (action === 'send_stop' || action === 'sigterm' || action === 'sigkill') {
-        this.host.signal(r.runDir, r.segment, action === 'sigkill' ? 'SIGKILL' : 'SIGTERM');
+        const control = action === 'send_stop' && cancel?.control_message && facts.shimAlive;
+        if (control) this.host.command(r.runDir, r.segment, { kind: 'rpc', id: 'stop', method: 'run.cancel', params: {
+          reason: ['cancel','pause'].includes(r.stop!.kind) ? 'supervisor' : r.stop!.kind, grace_s: cancel.grace_s } });
+        else this.host.signal(r.runDir, r.segment, action === 'sigkill' ? 'SIGKILL' : 'SIGTERM');
         this.store.transaction(() => {
-          if (action === 'send_stop') { r.stop!.sentAt = now; this.store.activity(r, r.segment, 'mac.stop_sent', { at: now }); }
-          if (action === 'sigterm') { r.cleanupTermAt = now; r.protocolViolation = 'forced eviction after run.finished'; }
+          if (action === 'send_stop' && !control) { r.stop!.sentAt = now; this.store.activity(r, r.segment, 'mac.stop_sent', { at: now }); }
+          if (action === 'sigterm') { r.cleanupTermAt = now; if (r.candidate?.source === 'runner') r.protocolViolation = 'forced eviction after run.finished'; }
           this.store.put(r);
         });
       }
@@ -256,8 +308,8 @@ export class Runtime {
         headUnchanged: r.workspaceHead === null || current.head === null ? null : r.workspaceHead === current.head, clean: current.clean })) {
         this.store.transaction(() => {
           const from = r.state;
-          if (r.launchAttempts >= 3) move(r, 'failed', 'launch_failed', 'T13');
-          else { r.launchAttempts++; move(r, 'queued', 'launch_no_work', 'T8'); }
+          if (r.launchAttempts >= 3) move(r, 'failed', 'launch_failed', 'T13', now);
+          else { r.launchAttempts++; move(r, 'queued', 'launch_no_work', 'T8', now); }
           r.finalizing = false; r.candidate = null; if (r.intent) r.intent.status = 'ended';
           this.store.put(r); stateEvent(this.store, r, from, now);
         }); return;
@@ -266,16 +318,16 @@ export class Runtime {
     const choice = candidateOutcome(r);
     this.store.transaction(() => {
       r.outputDrained = true; r.groupEmpty = true;
-      if (choice.state === 'waiting') { const from = r.state; finalize(r); this.store.put(r); stateEvent(this.store, r, from, now); }
+      if (choice.state === 'waiting') { const from = r.state; finalize(r, true, now); this.store.put(r); stateEvent(this.store, r, from, now); }
       else {
         r.finalizing = true; r.preservation = { state: 'pending', kind: choice.state === 'done' ? 'final' : 'wip', error: null, sha: null }; this.store.put(r);
       }
     });
     if (choice.state === 'waiting') return;
     if (r.segment === 0 || (r.stop?.kind === 'cancel' && !r.stop.preserveWip)) {
-      this.store.transaction(() => { const from = r.state; r.preservation = { state: 'not_required', kind: null, error: null, sha: null }; finalize(r); this.store.put(r); stateEvent(this.store, r, from, now); }); return;
+      this.store.transaction(() => { const from = r.state; r.preservation = { state: 'not_required', kind: null, error: null, sha: null }; finalize(r, true, now); this.store.put(r); stateEvent(this.store, r, from, now); }); return;
     }
-    await this.preserveAndFinalize(id, choice.state === 'done' ? 'final' : 'wip');
+    await this.preserveAndFinalize(id, choice.state === 'done' ? 'final' : 'wip', now);
   }
   close(): void { if (!this.closed) { this.closed = true; this.store.close(); this.release(); } }
 }

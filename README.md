@@ -53,11 +53,19 @@ NDJSON 与 SQLite 不存在跨文件的原子事务。实现遵守 R §14 的持
 
 恢复入口为 `await runtime.recover()`，应在重新调度前调用：无段目录时，恢复方独占创建 void fence，经 T8 释放预留；已有段且 shim 活着则重新接管；已有段且无法证明未执行时保守中断，不重发旧段。启动失败最多首次加三次重试；环境错误只有同时满足 `work_started=false`、没有工具/文件事件、Git HEAD 未变且工作区干净才允许 T8，未知事实按已工作处理。
 
-`decide(snapshot, now)` 不读数据库、进程或时钟。容量按预留计：启动中、running 收尾中、stdin waiting 始终占槽；resume waiting 不占槽，投递前重新取得容量。双层/账号容量算法是核心函数，D1 的 `Runtime` 仅配置简单全局容量；完整依赖、优先级、账号冻结/配额与租约策略留待 Phase 2。
+`decide(snapshot, now)` 不读数据库、进程或时钟。容量按预留计：启动中、running 收尾中、stdin waiting 始终占槽；resume waiting 不占槽，投递前重新取得容量。双层/账号容量算法是核心函数，D1 的 `Runtime` 仅配置简单全局容量；完整依赖、优先级、账号冻结/配额与租约策略留待 Phase 2。`tick()` 先消费输出，再执行 decide 的 `timeout`、`pause_budget` 决策；`start()` 仍由调用方显式执行。
 
-停止请求与结局候选在事务提交顺序上竞争；取消可覆盖已有暂停，但不会延长原来的清退时限。结局与物理清退分开：端点仍活着时默认等候选提交后 10 秒，再 TERM、5 秒后 KILL；端点已经退出而后代仍在时发现即 TERM，不等 10 秒。停止请求按**实际信号发出时间**加 grace + 5 秒升级 KILL。信号作用于整个端点进程组。时长可注入，测试同时验证默认边界和缩短时限下的真实进程行为。
+核心层 `create({timeouts: {total_s, idle_s, waiting_s}})` 可设时钟（秒，缺省不设），时钟事实存于 SQLite：total 只累计 running、跨 resume/启动重试段保留；idle 按段/重新投递输入启动，只有 R §10.2 的有效活动重置（相同 usage、log/error/limit.notice 不重置）；waiting 从进入 waiting 起算，接受消息或 complete 后停止。超时分别记录 `timeout_total`、`timeout_idle`、`timeout_waiting`，并做 WIP。该入口不代表已提供 HTTP API。
 
-状态只有在输出读完、进程组为空、保全完成后才落最终结果。`Preserver` 是必需的注入端口，须幂等；失败会显式记录 `preservation_failed` 并保护工作目录。测试使用**模拟保全标记**，不宣称生成了 WIP Git SHA。生产 Git worktree 创建、WIP/最终提交及交付物策略尚未接入；review/audit/integrate 角色确定性拒绝。宿主重启测试验证 interrupted + WIP 标记，并非真实重启 WSL。
+用量按段原样持久化于 `segmentUsage`，`usage` 汇总所有段，重放不重复累加。计数逐项忽略 null、全未知保持 null；`unknown_runs` 记录含未知计数或非 exact 回执的段数，只有全部段 exact 才汇总为 exact。`previousSteps` 覆盖 resume 与 launch_retry，所有段共享剩余步数。
+
+停止请求与结局候选在事务提交顺序上竞争；取消可覆盖已有暂停，但不会延长原来的清退时限。取消缺省不做 WIP，显式 `preserveWip=true` 才做；pause/budget/guard/timeout 总是做 WIP。没有进程的 paused/未启动状态可在 stop 事务里直接完成取消，旧候选不代表当前仍在收尾；stdin complete 的 outbox、finalizing 与版本号在同一事务提交，随后拒绝消息和二次 complete。
+
+shim 在 run.start 前读取端点 capabilities；声明 `cancel.control_message=true` 时先写 `run.cancel {reason, grace_s}`，否则发 SIGTERM。宽限期取声明的 `cancel.grace_s`，从 shim 实际写消息（或实际发 SIGTERM）起算，再加 5 秒升级 KILL。测试可注入 kill/exit 时限；没有能力声明时才使用注入的 grace。信号前核对 leader 的 boot/PID/start time、session/group，以及 leader 退出后留存成员的身份；测试清理使用相同保护。
+
+结局与物理清退分开：端点仍活着时默认等完成候选提交后 10 秒，再 TERM、5 秒后 KILL；端点已经退出而后代仍在时发现即 TERM，不等 10 秒。只有 runner 的 run.finished 之后被强制清退才改为 protocol_violation；进程崩溃后的后代清退保持 interrupted(runner_crash)。stderr/raw 的超长行截断并加标记，不关闭 stdout；1 MiB 协议行上限只作用于 stdout。
+
+状态只有在输出读完、进程组为空、保全完成后才落最终结果。`Preserver` 是必需的注入端口，须幂等；失败会显式记录 `preservation_failed` 并保护工作目录。测试使用**模拟保全标记**，不宣称生成了 WIP Git SHA。生产 Git worktree 创建、WIP/最终提交及交付物策略尚未接入；review/audit/integrate 角色确定性拒绝。宿主重启测试为状态层模拟：在跑的 run 中断并发出 host_restart 告警；已提交的 stop/candidate 保留原提交顺序；无进程的 resume waiting 保留令牌，可正常续段。未实际重启 WSL。
 
 ## Fake runner 子集
 
@@ -80,3 +88,10 @@ D1 不宣称通过 RC-01–RC-54 的全部档案。`--caps`、文件写入/产�
 没有 HTTP API、认证令牌服务、SSE、Web UI、Claude/Codex/Antigravity 适配器。`NotImplemented` 带 `status=501`、操作名和可用阶段；D1 创建入口对未实现字段与角色执行前拒绝，不创建 DB 资源。生产部署、多实例配置管理、systemd scope/cgroup/MemoryMax、工具链隔离、完整安全策略、真实 Git 保全和全量协议一致性报告均未完成。
 
 `fakeMaxSteps` 只用于 D1 内部测试与预算计数验证；Supervisor `budget`/`max_steps` 等 Phase 3 写入口仍拒绝。T2/T3/T6/T7/T20–T22 的合法边与归位纯函数已实现并测试，不代表 D1 已开放 Phase 2 依赖调度。
+
+本次返工明确保留的审查项（未实现/已知限制）：
+
+- S3：非环境类 failed 当前仍选 WIP；failed 的保全失败仍映射 interrupted。尚未按 R §9.7 改为最终提交及相应失败状态。
+- S4 / S8 剩余：`decide` 的 `recover_launch` **未在 tick 接线**，pending 启动没有专门的确认超时/fencing 恢复，仍须显式 `recover()`；`acquire_lease` **未接线**，没有生产租约服务。
+- S6：JSON-RPC error 回执仍被判协议违规；outbox 对未确认命令仍会在 tick 重发，未实现请求级错误归类与重试节流。
+- S9：`resume.usage_baseline` 仍为 null；recover 未核对 launch.json token；Host 启动 shim 的 ChildProcess 未监听 error；`eventsSince` 未提供 next_since；文件短于消费偏移时诊断未去重，收尾时 close 命令文件未去重。

@@ -3,10 +3,15 @@ import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { alive, bootId, durableJson, groupAlive, jsonFile, signalGroup, syncDirectory, tryLock } from './process.js';
+import { alive, durableJson, jsonFile, ownsGroup, signalGroup, syncDirectory, tryLock } from './process.js';
 import type { LaunchRecord, ShimCommand, ShimRequest, ShimStatus } from './shim-types.js';
 import type { LaunchIntent } from '../core/types.js';
 
+function recordedGroup(status: ShimStatus | null) {
+  const group = status?.group, endpoint = status?.endpoint;
+  return group && endpoint && status.pgid === endpoint.pid && group.leader.pid === endpoint.pid
+    && group.leader.start === endpoint.start && group.leader.boot === endpoint.boot && status.boot === endpoint.boot ? group : null;
+}
 export class Host {
   directory(runDir: string, segment: number): string { return join(runDir, 'segments', String(segment)); }
   launch(request: ShimRequest): void {
@@ -21,9 +26,8 @@ export class Host {
   launchRecord(runDir: string, segment: number): LaunchRecord | null { return jsonFile<LaunchRecord>(join(this.directory(runDir, segment), 'launch.json')); }
   facts(runDir: string, segment: number): { shimAlive: boolean; endpointAlive: boolean; groupAlive: boolean; outputDrained: boolean; status: ShimStatus | null } {
     const status = this.status(runDir, segment), record = this.launchRecord(runDir, segment);
-    const sameBoot = status?.boot === bootId();
     return { shimAlive: alive(status?.shim ?? record?.shim ?? null), endpointAlive: alive(status?.endpoint ?? null),
-      groupAlive: !!status?.pgid && sameBoot && groupAlive(status.pgid), outputDrained: status?.outputDrained ?? false, status };
+      groupAlive: ownsGroup(recordedGroup(status)), outputDrained: status?.outputDrained ?? false, status };
   }
   command(runDir: string, segment: number, command: ShimCommand): void {
     const dir = join(this.directory(runDir, segment), 'commands');
@@ -32,7 +36,8 @@ export class Host {
   }
   signal(runDir: string, segment: number, signal: NodeJS.Signals): void {
     const status = this.status(runDir, segment);
-    if (status?.pgid && status.boot === bootId()) signalGroup(status.pgid, signal);
+    const group = recordedGroup(status);
+    if (group) signalGroup(group, signal);
   }
   fenceMissing(runDir: string, intent: LaunchIntent): 'void' | 'existing' | 'busy' {
     const dir = this.directory(runDir, intent.segment);

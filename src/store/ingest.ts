@@ -31,6 +31,7 @@ export function ingest(store: Store, runId: string, path: string, now = Date.now
       const line = bytes.subarray(offset, end);
       offset = end + 1;
       const before = run.state;
+      const stopBefore = run.stop;
       try {
         if (line.length > 1_048_576) throw new ProtocolError('line_too_large');
         const frame = JSON.parse(line.toString('utf8')) as { jsonrpc?: string; method?: string; params?: RunnerEvent; id?: unknown; error?: unknown; result?: { accepted?: boolean } };
@@ -47,6 +48,10 @@ export function ingest(store: Store, runId: string, path: string, now = Date.now
           if (reduce === applyEvent) {
             try { reduce(run, e, now); } catch (error) { run.protocolViolation = String(error); }
           } else reduce(run, e, now);
+          if (run.stop !== stopBefore) {
+            run.version++;
+            store.emit('run.stop_requested', { stop_request: run.stop, version: run.version }, run, now);
+          }
           store.db.prepare('INSERT INTO consumed VALUES (?,?,?,?,?)').run(run.id, run.segment, e.seq, digest, offset);
           c.lastSeq = e.seq; c.finished = e.type === 'run.finished'; if (c.finished) c.finishedOffset = offset;
           const runSeq = store.activity(run, run.segment, e.type, e.data, e.ts);

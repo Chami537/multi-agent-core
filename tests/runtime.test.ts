@@ -6,17 +6,10 @@ import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Runtime } from '../dist/core/runtime.js';
 import { move } from '../dist/core/lifecycle.js';
-import { alive, bootId, jsonFile } from '../dist/host/process.js';
-import type { StartParams } from '../dist/core/types.js';
-import { allocations, cleanup, makeRuntime, markerPreserver, prompt, state, until, workspace } from './helpers/runtime.js';
+import { alive, identity, jsonFile, signalProcess } from '../dist/host/process.js';
+import { allocations, cleanup, launchFixture, makeRuntime, markerPreserver, prompt, state, until, workspace } from './helpers/runtime.js';
 
 afterEach(cleanup);
-function launchFixture(rt:Runtime, mode:string) {
-  const r=rt.create({workspace:workspace(rt)});r.segment=1;r.intent={runId:r.id,segment:1,segmentKind:'initial',launchToken:randomUUID(),daemonEpoch:rt.epoch,status:'pending'};
-  rt.store.transaction(()=>{move(r,'running',null);rt.store.put(r);});
-  const start:StartParams={run_id:r.id,segment:1,prompt:{text:'test',format:'markdown'},model:{id:'fake-high'},reasoning_effort:{effort:'default',native:null},interaction:'autonomous',workspace:{cwd:r.workspace,read_only:false,artifacts_dir:r.runDir,scratch_dir:r.runDir,readonly_paths:[]},limits:{max_steps:null,total_s:null,idle_s:null},forbidden:[],resume:null,raw_dir:null,conformance:null};
-  rt.host.launch({runDir:r.runDir,segment:1,token:r.intent.launchToken,command:[process.execPath,resolve('tests/helpers/endpoint.mjs'),mode],cwd:r.workspace,env:{},start});return r;
-}
 describe('real shim + fake runner',()=>{
  it('normal completion commits only after physical exit and preservation',async()=>{
    const rt=makeRuntime(),r=rt.create({workspace:workspace(rt)});rt.start(r.id);const done=await state(rt,r.id,'done');expect(done.preservation.state).toBe('saved');expect(existsSync(join(r.runDir,'final-marker.json'))).toBe(true);expect(rt.host.facts(r.runDir,1).groupAlive).toBe(false);expect(done.reservation).toBe(false);
@@ -33,7 +26,10 @@ describe('real shim + fake runner',()=>{
    const next=new Runtime({root:rt.root,preserve:markerPreserver,timing:{exitMs:120,killMs:70,graceMs:70}});allocations.push({root:rt.root,runtime:next});await next.recover();expect((await state(next,r.id,'done')).messages[0]?.state).toBe('delivered');
  });
  it('stdin complete closes a resident endpoint',async()=>{
-   const rt=makeRuntime(),r=rt.create({workspace:workspace(rt),inputMode:'stdin',prompt:prompt('interactive:2')});rt.start(r.id);await state(rt,r.id,'waiting');rt.complete(r.id);expect((await state(rt,r.id,'done')).segment).toBe(1);
+   const rt=makeRuntime(),r=rt.create({workspace:workspace(rt),inputMode:'stdin',prompt:prompt('interactive:2')});rt.start(r.id);const waiting=await state(rt,r.id,'waiting');rt.complete(r.id);
+   expect(rt.store.get(r.id).finalizing).toBe(true);expect(rt.store.get(r.id).version).toBe(waiting.version+1);
+   expect(()=>rt.message(r.id,'too-late','go')).toThrow('invalid_message_state');expect(()=>rt.complete(r.id)).toThrow('invalid_complete_state');
+   const done=await state(rt,r.id,'done');expect(done.segment).toBe(1);expect(done.messages.filter(m=>m.state==='pending')).toHaveLength(0);
  });
  it('resume waiting releases capacity and next input starts a new fenced segment',async()=>{
    const rt=makeRuntime(),r=rt.create({workspace:workspace(rt),inputMode:'resume',prompt:prompt('interactive:1')});rt.start(r.id);const waiting=await state(rt,r.id,'waiting');expect(waiting.reservation).toBe(false);expect(waiting.resumeToken).toBeTypeOf('string');
@@ -53,7 +49,7 @@ describe('real shim + fake runner',()=>{
  it('script without step is one model invocation',async()=>{
    const rt=makeRuntime(),r=rt.create({workspace:workspace(rt),fakeMaxSteps:1});rt.start(r.id);expect((await state(rt,r.id,'done')).usage.steps).toBe(1);
  });
- it('stop escalates unresponsive endpoint to SIGKILL and retains its requested outcome',async()=>{
+ it('stop uses the declared control message even when the fake ignores SIGTERM',async()=>{
    const rt=makeRuntime(),r=rt.create({workspace:workspace(rt),prompt:prompt('ignore_term')});rt.start(r.id);
    await until(async()=>{await rt.tick();return rt.store.get(r.id).usage.steps===1;}); await new Promise(res=>setTimeout(res,80));rt.stop(r.id);expect((await state(rt,r.id,'cancelled')).reason).toBe('supervisor_cancel');expect(rt.host.facts(r.runDir,1).groupAlive).toBe(false);
  });
@@ -73,20 +69,16 @@ describe('real shim + fake runner',()=>{
  });
  it('SIGKILL of a real daemon leaves shim and endpoint alive and another daemon reattaches',async()=>{
    const root=mkdtempSync(join(tmpdir(),'mac-daemon-')),ws=join(root,'workspace');mkdirSync(ws);
-   const daemon=spawn(process.execPath,[resolve('tests/helpers/daemon.mjs'),root,ws],{stdio:'ignore'});let rt:Runtime|undefined;
+   const daemon=spawn(process.execPath,[resolve('tests/helpers/daemon.mjs'),root,ws],{stdio:'ignore'}),daemonIdentity=identity(daemon.pid!);let rt:Runtime|undefined;
    try{
      await until(()=>existsSync(join(root,'ready.json')));const info=jsonFile<{runId:string;shim:{pid:number;start:string;boot:string};endpoint:{pid:number;start:string;boot:string}}>(join(root,'ready.json'))!;
-     process.kill(daemon.pid!,'SIGKILL');await new Promise<void>(resolve=>daemon.once('close',()=>resolve()));expect(alive(info.shim)).toBe(true);expect(alive(info.endpoint)).toBe(true);
+     signalProcess(daemonIdentity,'SIGKILL');await new Promise<void>(resolve=>daemon.once('close',()=>resolve()));expect(alive(info.shim)).toBe(true);expect(alive(info.endpoint)).toBe(true);
      rt=new Runtime({root,preserve:markerPreserver,timing:{exitMs:120,killMs:70,graceMs:70}});allocations.push({root,runtime:rt});await rt.recover();expect(rt.store.get(info.runId).state).toBe('running');expect(rt.host.facts(rt.store.get(info.runId).runDir,1).endpointAlive).toBe(true);
      rt.stop(info.runId);await state(rt,info.runId,'cancelled');
-   }finally{if(daemon.exitCode===null&&daemon.signalCode===null)process.kill(daemon.pid!,'SIGKILL');}
+   }finally{if(daemon.exitCode===null&&daemon.signalCode===null)signalProcess(daemonIdentity,'SIGKILL');}
  });
  it('instance flock forbids concurrent executors and epoch increments after detach',()=>{
    const rt=makeRuntime();expect(()=>new Runtime({root:rt.root,preserve:markerPreserver})).toThrow('instance_locked');const epoch=rt.epoch;rt.close();const next=new Runtime({root:rt.root,preserve:markerPreserver});allocations.push({root:rt.root,runtime:next});expect(next.epoch).toBe(epoch+1);
- });
- it('host restart simulation interrupts running and waiting runs with WIP markers',async()=>{
-   const rt=makeRuntime({boot:'old-boot'});const r=rt.create({workspace:workspace(rt)});r.state='running';r.reservation=true;rt.store.transaction(()=>rt.store.put(r));const waiting=rt.create({workspace:workspace(rt),inputMode:'resume'});waiting.state='waiting';rt.store.transaction(()=>rt.store.put(waiting));rt.close();
-   const next=new Runtime({root:rt.root,preserve:markerPreserver,boot:bootId()});allocations.push({root:rt.root,runtime:next});await next.recover();for(const id of [r.id,waiting.id]){const recovered=next.store.get(id);expect(recovered.state).toBe('interrupted');expect(recovered.reason).toBe('host_restart');expect(recovered.preservation.kind).toBe('wip');expect(recovered.preservation.state).toBe('saved');expect(existsSync(join(recovered.runDir,'wip-marker.json'))).toBe(true);}
  });
  it('missing startup directory is fenced void and retries use a fresh segment number',async()=>{
    const rt=makeRuntime(),r=rt.create({workspace:workspace(rt)});r.segment=1;r.intent={runId:r.id,segment:1,segmentKind:'initial',launchToken:randomUUID(),daemonEpoch:rt.epoch,status:'pending'};rt.store.transaction(()=>{move(r,'running',null);rt.store.put(r);});
