@@ -3,8 +3,8 @@
 | 项 | 值 |
 |---|---|
 | 协议标识 | `mac.runner` |
-| 本文版本 | `0.2`（草案 · 交叉审查返工修订，关闭必修 M01–M22 · 待主管复核）。逐条修订记录见 [spec-revision-log.md](spec-revision-log.md) |
-| 协议版本 | `0.2`（`initialize` 协商值）。0.1 草案未被实现即被本版取代，两者不兼容，宿主与端点都不得声明支持 `0.1`（[§5](#5-版本协商)） |
+| 本文版本 | `0.2`（草案 · 交叉审查返工修订，关闭必修 M01–M22；补丁轮修补 delta 复审缺陷 D4、D6 中涉及下游协议的部分 · 待主管复核）。逐条修订记录见 [spec-revision-log.md](spec-revision-log.md) |
+| 协议版本 | `0.2`（`initialize` 协商值）。0.1 草案未被实现即被本版取代，两者不兼容，宿主与端点都不得声明支持 `0.1`（[§5](#5-版本协商)）。补丁轮不改版本号：0.2 同样尚未实现，补丁按草案期原位勘误处理，记入[变更记录](#变更记录) |
 | 对应需求 | R26（主）；关联 R4、R5、R8、R10、R11、R12、R13、R19、R21、R22、R24 |
 | 姊妹协议 | [Supervisor Protocol](supervisor-protocol.md)（R25 · 上游调用） |
 | 规范性绑定 | 子进程 + stdio NDJSON（消息采用 JSON-RPC 2.0 结构）。HTTP 绑定为预留，见 [§3.3](#33-http-绑定预留非规范性) |
@@ -659,7 +659,7 @@ R11：探活分级。
 
 **规则**
 
-- 发出 `run.finished` 之后不得再输出任何协议消息。宿主收到后关闭 stdin，端点应当在 10 秒内退出。
+- 发出 `run.finished` 之后不得再输出任何协议消息。宿主收到后关闭 stdin，端点必须在 10 秒内退出，并且不遗留后代进程。否则宿主强制清退（向整个进程组和 scope 发 SIGTERM，5 秒后 SIGKILL），本段判为协议违规（§13.5），结局为 `protocol_violation`（Supervisor Protocol §9.6「物理清退」）。停止请求先于结局候选提交时，清退按 §9.5 的宽限期执行，结局仍按停止请求的种类。
 - **`run.finished` 只是结局候选**：它不表示进程组已经退出，也不表示输出已经读完。宿主在 stdout 到达 EOF、进程组与 scope 确认为空、保全与交付物校验结束之后，才提交最终状态（Supervisor Protocol §9.6）。在此之前发现的尾部协议违规（比如 `run.finished` 之后还有输出）会把结局改为 `protocol_violation`。
 - 进程退出时没有发过 `run.finished`：宿主判为 `runner_crash`。
 - `run.finished` 表示成功但退出码不是 0：宿主以 `run.finished` 为准，另记一条告警。
@@ -677,6 +677,7 @@ Supervisor Protocol §9 定义了 run 状态。端点的行为与状态迁移按
 | `input.requested`（stdin 方式） | 停止无输出计时，开始等待计时 | `waiting`（进程常驻，占槽） |
 | `run.finished` 为 `awaiting_input`（resume 方式） | 保存 `resume_token`；进程组退出后释放容量，开始等待计时 | `waiting`（不占槽） |
 | `run.finished` 为 `completed` | 记为结局候选；收尾：读完输出、确认进程组退出、最终提交、校验交付物 | `done`；或 `failed`（`deliverable_invalid`、`protocol_violation`、`preservation_failed`）；停止请求先提交时按其种类（Supervisor Protocol §9.6） |
+| `run.finished` 之后 10 秒内没有退出，或退出后进程组、scope 中仍有后代进程（没有先提交的停止请求） | 强制清退：向整个进程组和 scope 发 SIGTERM，5 秒后 SIGKILL；确认为空后照常保全 | `failed`（`protocol_violation`，Supervisor Protocol §9.6） |
 | `run.finished` 为 `failed`，错误属环境类（[§13.2](#132-码表)），且未产生工作 | 处理账号或 runner 状态（§13.3），run 回到调度 | 回到 `queued`（T8） |
 | `run.finished` 为 `failed`，错误属环境类，已产生工作 | WIP 提交，处理账号或 runner 状态 | `interrupted` |
 | `run.finished` 为 `failed`，错误属非环境类 | 最终提交 | `failed`，或 `paused`（`step_limit_reached`） |
@@ -984,6 +985,7 @@ Supervisor Protocol §9 定义了 run 状态。端点的行为与状态迁移按
 - 单行超过 1 MiB；
 - `seq` 跳号或重复；
 - `run.finished` 之后还有输出，或者出现了两次 `run.finished`；
+- 没有先提交的停止请求时，`run.finished` 之后 10 秒内没有退出，或退出后进程组、scope 中仍有后代进程（宿主强制清退，§9.6）；
 - `session.started` 不是第一条事件；
 - 缺少必填字段；
 - 方法响应超时。
@@ -1170,9 +1172,9 @@ conformance/fixtures/<runner>/<scenario>/
 | `suite_version` | string | 比如 `0.2.0`，与协议 `0.2` 对应 |
 | `protocol_version` | string | 测试时协商出的版本。准入时必须等于宿主与该端点当前协商出的版本 |
 | `subject` | object | `{runner_id, impl_version, native_version, artifact_sha256, interpreter}`。`runner_id` 必须等于登记项 `id`，也必须等于 `initialize` 回报的 `runner.id`；`artifact_sha256` 按下面的规范投影计算；`interpreter` 是登记项中的 `{path, version}`，没有时为 `null` |
-| `capability_classes` | object[] | 报告覆盖的能力等价集合：`{features_sha256, accounts, required_profiles}`。`features_sha256` 按下面的规范投影计算；`accounts` 是测试时使用这一能力集合的账号别名（替身模式下可以是套件内置账号）；`required_profiles` 是由这份 `features` 推导出的必需档案 |
-| `profiles` | object[] | `{id, required, status}`；`status` 取 `pass`、`fail` 或 `not_applicable` |
-| `cases` | object[] | `{id, profile, status, mode, evidence, reason, duration_ms}`；`status` 取 `pass`、`fail` 或 `skip`；`mode` 取 `auto`、`live` 或 `review`；`evidence` 取 `native`（回放输入是原生录制，或用了真实工具）、`synthetic`（合成故障）或 `n/a` |
+| `capability_classes` | object[] | 报告覆盖的能力等价集合：`{features_sha256, accounts, required_profiles}`。`features_sha256` 按下面的规范投影计算；`accounts` 是测试时使用这一能力集合的账号别名（替身模式下可以是套件内置账号）；`required_profiles` 是由这份 `features` 推导出的必需档案。每一类的档案与用例结果分别列在 `profiles`、`cases` 中，以 `features_sha256` 归属 |
+| `profiles` | object[] | `{features_sha256, id, required, status}`。`features_sha256` 指明这条档案结果属于哪个能力集合，必须等于 `capability_classes` 中某一项的 `features_sha256`（Supervisor 套件报告中为 `null`）；`(features_sha256, id)` 在报告内唯一，不同能力集合各自列出自己的档案，即使档案同名；`required` 相对于该能力集合；`status` 取 `pass`、`fail` 或 `not_applicable` |
+| `cases` | object[] | `{features_sha256, id, profile, status, mode, evidence, reason, duration_ms}`；`features_sha256` 与 `profile` 一起指明用例属于哪个能力集合的哪个档案，取值规则同 `profiles`；`status` 取 `pass`、`fail` 或 `skip`；`mode` 取 `auto`、`live` 或 `review`；`evidence` 取 `native`（回放输入是原生录制，或用了真实工具）、`synthetic`（合成故障）或 `n/a` |
 | `review` | object[] | 评审项的结论：`{id, reviewer, verdict, note}` |
 | `live` | object\|null | `{host_label, account, ran_at}`。`account` 只写别名 |
 | `trigger` | object\|null | 为解除暂停或再验证而跑的报告，写明触发：`{kind, at}`，`kind` 取 `suspension`、`native_drift`、`artifact_changed`、`capabilities_changed`、`protocol_changed`、`suite_changed`；首次准入时为 `null` |
@@ -1197,19 +1199,19 @@ conformance/fixtures/<runner>/<scenario>/
       "required_profiles": ["core", "usage-stream", "interactive-resume", "read-only", "max-steps", "raw-capture", "live"] }
   ],
   "profiles": [
-    { "id": "core", "required": true, "status": "pass" },
-    { "id": "usage-stream", "required": true, "status": "pass" },
-    { "id": "interactive-resume", "required": true, "status": "pass" },
-    { "id": "read-only", "required": true, "status": "pass" },
-    { "id": "max-steps", "required": true, "status": "pass" },
-    { "id": "raw-capture", "required": true, "status": "pass" },
-    { "id": "live", "required": true, "status": "pass" },
-    { "id": "interactive-live", "required": false, "status": "not_applicable" }
+    { "features_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d", "id": "core", "required": true, "status": "pass" },
+    { "features_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d", "id": "usage-stream", "required": true, "status": "pass" },
+    { "features_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d", "id": "interactive-resume", "required": true, "status": "pass" },
+    { "features_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d", "id": "read-only", "required": true, "status": "pass" },
+    { "features_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d", "id": "max-steps", "required": true, "status": "pass" },
+    { "features_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d", "id": "raw-capture", "required": true, "status": "pass" },
+    { "features_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d", "id": "live", "required": true, "status": "pass" },
+    { "features_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d", "id": "interactive-live", "required": false, "status": "not_applicable" }
   ],
   "cases": [
-    { "id": "RC-01", "profile": "core", "status": "pass", "mode": "auto", "evidence": "n/a", "reason": null, "duration_ms": 41 },
-    { "id": "RC-22", "profile": "core", "status": "pass", "mode": "auto", "evidence": "synthetic", "reason": "网关故障录制尚未取得，验证映射逻辑", "duration_ms": 388 },
-    { "id": "RC-46", "profile": "live", "status": "pass", "mode": "live", "evidence": "native", "reason": null, "duration_ms": 48210 }
+    { "features_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d", "id": "RC-01", "profile": "core", "status": "pass", "mode": "auto", "evidence": "n/a", "reason": null, "duration_ms": 41 },
+    { "features_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d", "id": "RC-22", "profile": "core", "status": "pass", "mode": "auto", "evidence": "synthetic", "reason": "网关故障录制尚未取得，验证映射逻辑", "duration_ms": 388 },
+    { "features_sha256": "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d", "id": "RC-46", "profile": "live", "status": "pass", "mode": "live", "evidence": "native", "reason": null, "duration_ms": 48210 }
   ],
   "review": [
     { "id": "RC-49", "reviewer": "review-run:run_01JDQX5…", "verdict": "pass", "note": "auth 探针只读本地凭证文件" }
@@ -1233,7 +1235,7 @@ conformance/fixtures/<runner>/<scenario>/
 3. **产物绑定**：`subject.artifact_sha256` 等于按 [§16.5](#165-报告格式) 投影重新计算的当前产物哈希；`subject.interpreter` 与登记项一致；`command[0]` 在产物边界之内（[§3.2](#32-启动约定)）。端点升级后必须重新跑套件。
 4. 准入没有处于 `suspended` 状态。
 
-**账号级条件**：账号当前 `features` 的 `features_sha256` 出现在报告的 `capability_classes` 中，并且该类的必需档案在报告中都是 `pass`。必需档案由当前 `features` 重新推导（§16.3），不以报告自己的说法为准。不满足的账号单独不准入（Supervisor `unadmitted` 中带 `account`），同一 runner 的其他账号不受影响。
+**账号级条件**：账号当前 `features` 的 `features_sha256` 出现在报告的 `capability_classes` 中，并且**逐类核验**通过：报告中 `features_sha256` 等于该类哈希的 `profiles` 条目，覆盖由当前 `features` 重新推导出的全部必需档案（§16.3，不以报告自己的 `required` 或 `required_profiles` 为准），且都是 `pass`；归属该类、属于这些档案的 `cases` 中没有 `fail`。其他能力集合的结果不能替代，即使档案同名。不满足的账号单独不准入（Supervisor `unadmitted` 中带 `account`），同一 runner 的其他账号不受影响。
 
 **目录新鲜度**（不属于准入）：每次刷新 capabilities，宿主都对 `models` 做结构校验：schema 合法、强度映射是单射、`default_effort` 在 `efforts` 中。不合格的模型条目按 `unavailable` 处理并告警，不影响账号准入。`availability: verified` 的证据规则见 [§6.3](#63-模型目录与强度映射)。
 
@@ -1263,7 +1265,7 @@ conformance/fixtures/<runner>/<scenario>/
 - 只在生产者已经停止时修复残缺的末行（§14）；
 - 按 §10.4 执行无输出计时；
 - 按 §13.4 判定「未产生工作」；
-- 把 `run.finished` 当作结局候选，等输出读完、进程组退出、保全与校验结束后才提交最终状态（Supervisor Protocol §9.6）；
+- 把 `run.finished` 当作结局候选，等输出读完、进程组退出、保全与校验结束后才提交最终状态（Supervisor Protocol §9.6）；结局候选提交后照常执行物理清退：退出期限到时进程组或 scope 仍不为空，就发 SIGTERM，5 秒后 SIGKILL；
 - 按 §16.6 评估准入；原生版本漂移时暂停安全相关能力；
 - 不准入 HTTP 端点（v0）。
 
@@ -1384,7 +1386,7 @@ fake runner 对「只读」「禁止事项」用模拟方式执行：只读模�
 | RD-13 | **P2** shim 逐行落盘并按字节偏移消费；归约、用量、上游事件与偏移同事务提交，按 `(run_id, segment, seq)` 去重；只在生产者停止后修复尾行；stdin EOF 时端点自停；`seq` 连续（v0.2 修订） | §14 |
 | RD-14 | **P4** 准入的唯一依据是套件通过；声明即受测；`live` 档案只在持证宿主上跑 | §16.1 |
 | RD-15 | 用原生替身加 fixture 测试桥的真实代码路径；fixture 分 `historical`、`native_recording`、`synthetic_fault` 三种证据等级，golden 回放只用原生录制；`SOURCE.md` 写明等级与来源（v0.2 修订） | §16.2 |
-| RD-16 | 准入只绑定最低必要：协议版本、桥的可执行产物（规范清单哈希）与影响执行的能力（按账号的 `features` 等价集合）；目录新鲜度单独管理；报告身份必须绑定；解除暂停只认触发后的新报告；原生版本漂移时立即暂停安全能力并设再验证期限（v0.2 修订） | §16.5、§16.6 |
+| RD-16 | 准入只绑定最低必要：协议版本、桥的可执行产物（规范清单哈希）与影响执行的能力（按账号的 `features` 等价集合）；目录新鲜度单独管理；报告身份必须绑定；解除暂停只认触发后的新报告；原生版本漂移时立即暂停安全能力并设再验证期限；报告中的档案与用例结果以 `features_sha256` 归属能力集合，准入逐类核验（v0.2 修订，补丁轮修订） | §16.5、§16.6 |
 | RD-17 | 禁止事项与只读按威胁模型分 `enforced`、`advisory`、`audit` 三个保证等级；只有 agent 无法自行解除的 enforced 级计入运行期强制；runner 层声明须经绕过尝试测试 | §12.2、§12.3 |
 
 ## 附录 A：完整会话转录
@@ -1483,3 +1485,4 @@ fake runner 对「只读」「禁止事项」用模拟方式执行：只读模�
 |---|---|---|
 | 0.1-draft | 2026-11-27 | 首版草案（Phase 1 首批交付），落实计划 v1.2 R26 与主管四项协议原则 |
 | 0.2-draft | 2026-11-27 | 交叉审查返工修订：关闭必修 M01–M22 中涉及下游协议的条目（逐条记录见 [spec-revision-log.md](spec-revision-log.md)）。协议版本升为 `0.2`，与未实现的 0.1 草案不兼容；`mac.conformance-report`、`mac.fake-scenario` schema 升为 `0.2`。新增 RD-17，修订 RD-06、08、10、11、13、15、16 |
+| 0.2-draft（补丁轮） | 2026-11-27 | 修补 delta 复审缺陷中涉及下游协议的部分（逐条记录见 [spec-revision-log.md](spec-revision-log.md) §7）：`run.finished` 之后 10 秒内必须退出且不遗留后代，否则宿主强制清退并判协议违规（D4，§9.6、§9.7、§13.5、§16.7）；一致性报告的 `profiles`、`cases` 带 `features_sha256`，准入按能力集合逐类核验（D6，§16.5、§16.6）。**协议版本仍为 `0.2`**：0.2 尚未实现，本轮按草案期原位勘误处理（§5）；`mac.conformance-report` 结构有增补，schema 编号仍为 `0.2`。修订 RD-16 |

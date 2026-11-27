@@ -3,8 +3,8 @@
 | 项 | 值 |
 |---|---|
 | 协议标识 | `mac.supervisor` |
-| 本文版本 | `0.2`（草案 · 交叉审查返工修订，关闭必修 M01–M22 · 待主管复核）。逐条修订记录见 [spec-revision-log.md](spec-revision-log.md) |
-| 协议版本 | `0.2`（线上协商值）。0.1 草案未被实现即被本版取代，两者不兼容，任何一方都不得声明支持 `0.1`（[§3.1](#31-版本号)） |
+| 本文版本 | `0.2`（草案 · 交叉审查返工修订，关闭必修 M01–M22；补丁轮修补 delta 复审缺陷 D1–D8 · 待主管复核）。逐条修订记录见 [spec-revision-log.md](spec-revision-log.md) |
+| 协议版本 | `0.2`（线上协商值）。0.1 草案未被实现即被本版取代，两者不兼容，任何一方都不得声明支持 `0.1`（[§3.1](#31-版本号)）。补丁轮不改版本号：0.2 同样尚未实现，补丁按草案期原位勘误处理，记入[变更记录](#变更记录) |
 | 对应需求 | R25（主）；关联 R5、R9、R13、R14、R15、R16、R17、R18、R20、R24 |
 | 姊妹协议 | [Runner Protocol](runner-protocol.md)（R26 · 下游接入） |
 | 规范性绑定 | HTTP/JSON（REST）+ SSE。v0 只定义这一种绑定 |
@@ -150,13 +150,13 @@ must-ignore **不适用于请求**。服务端严格校验请求体：请求中�
 | 键的构成 | 1–128 个可见 ASCII 字符。客户端应当用「客户端名 : 客户端侧业务 ID : 操作名」拼接，并且这个值在网络重试之间保持不变，例如 `xiaoba:t003-protocol:create-task`、`xiaoba:t003-protocol:continue:run_01JDR3K9…:1`。禁止每次重试重新生成随机值；随机 UUID 只能在首次发起时生成并持久化 |
 | 作用域 | `(principal, HTTP 方法, 规范化实际路径, key)`。「实际路径」是带具体资源 ID 的请求路径，**不是路径模板**：同一主体用同一个 key、同样的请求体先后取消 run A 与 run B，分别落在 `/v0/runs/run_A…/cancel` 与 `/v0/runs/run_B…/cancel` 两个作用域，互不回放。规范化方式：去掉查询串和末尾的 `/`；非保留字符的百分号编码先解码；其余百分号编码统一用大写十六进制。不同令牌主体之间互不影响 |
 | 请求指纹 | SHA-256（小写十六进制）。输入是下面这个对象按 RFC 8785（JCS）规范化后的 UTF-8 字节：`{"protocol": <effective MAJOR.MINOR>, "method": <方法>, "path": <规范化实际路径>, "query": <查询参数按键排序组成的对象，没有时为 {}>, "body": <请求体 JSON，没有时为 null>}`。会影响操作语义的路径、参数和协议版本都在指纹内。请求头中只有 `Supervisor-Protocol` 进入指纹（以 effective 值的形式） |
-| 记录与变更同事务 | 服务端在**同一个 SQLite 事务**中完成：校验 → 资源变更 → 把幂等记录置为 `completed`，记录状态码和响应体（或能确定性重建响应的资源引用）。提交之后发生的任何失败（序列化、连接断开、回包出错）都不改变已提交的结果，重试会回放它。外部副作用（拉起进程、发送信号、删除 git 引用或目录）**不在请求事务内执行**：请求事务只提交持久意图，再由宿主按意图幂等执行（停止请求见 [§9.6](#96-停止请求完成候选与收尾)，释放 worktree 见 [§10.8](#108-释放-worktree-post-v0runsrun_idrelease-worktree)） |
+| 记录与变更同事务 | 服务端在**同一个 SQLite 事务**中完成：校验 → 资源变更 → 把幂等记录置为 `completed`，记录状态码和响应体（或能确定性重建响应的资源引用）。提交之后发生的任何失败（序列化、连接断开、回包出错）都不改变已提交的结果，重试会回放它。外部副作用（拉起进程、发送信号、删除 git 引用或目录）**不在请求事务内执行**：请求事务只提交持久意图，再由宿主按意图幂等执行（停止请求见 [§9.6](#96-停止请求完成候选与收尾)，释放 worktree 见 [§10.8](#108-释放-worktree-post-v0runsrun_idrelease-worktree)）。唯一的例外是批量调档：它逐个 run 生效，用持久的批次计划与逐项进度代替单一事务（[§10.7](#107-批量调档-post-v0runsbatch-adjust)） |
 | 回放 | 同作用域、同指纹：返回已记录的状态码和响应体，加响应头 `Idempotent-Replayed: true`，不再执行 |
-| 哪些结果被记录 | 2xx 全部记录。确定性拒绝（`400`、`403`、`404`、`409`、`412`、`422`）也记录，并且与校验在同一事务中提交：同键重试得到同一个拒绝，即使资源状态之后变了（同一个键不得在重试之间改变含义）。以下结果不记录：`401`（没有主体）、`429`、`503`、`409 idempotency_conflict`、`409 idempotency_in_progress`（它们描述的是键本身或暂时状态） |
+| 哪些结果被记录 | 2xx 全部记录。确定性拒绝（`400`、`403`、`404`、`409`、`412`、`422`）也记录，并且与校验在同一事务中提交：同键重试得到同一个拒绝，即使资源状态之后变了（同一个键不得在重试之间改变含义）。以下结果不记录：`401`（没有主体）、`429`、`503`、`501`（阶段子集中尚未实现，[§17.4](#174-分阶段一致性子集)）、`409 idempotency_conflict`、`409 idempotency_in_progress`（它们描述的是键本身、服务端或暂时状态） |
 | 5xx | 只在事务**没有提交**（已回滚）时才可以返回。此时没有任何资源变更，也没有 `completed` 记录，重试会重新执行，并且只执行一次。事务提交之后才发现的错误不得以 5xx 返回，必须回放已提交的结果 |
 | 同键异指纹 | `409 idempotency_conflict`，错误体给出首次请求的 `request_id` 和时间 |
-| 同键在途 | 服务端在执行之前，用一个独立的短事务写入 `in_progress` 记录，带本次守护进程启动号 `boot_id`。首次请求还没完成时又到了同键请求：返回 `409 idempotency_in_progress`，带 `Retry-After: 1` |
-| 崩溃恢复 | 守护进程启动时，处理所有 `boot_id` 不是本次启动的 `in_progress` 记录。资源变更与 `completed` 记录在同一事务中提交，所以这类记录背后必然**没有任何已提交的变更**；服务端删除它们，之后的同键重试按新请求执行，并且只执行一次。`in_progress` 记录**不受窗口过期影响**，只由这一恢复流程清除 |
+| 同键在途 | 服务端在执行之前，用一个独立的短事务写入 `in_progress` 记录，带本次守护进程启动号 `boot_id`。首次请求还没完成时又到了同键请求：返回 `409 idempotency_in_progress`，带 `Retry-After: 1`。**回滚后清除**：请求以不记录的结果结束（比如事务已确认回滚后返回 5xx）时，服务端先在一个短事务中删除本请求写入的 `in_progress` 记录，再返回响应，同进程内的同键重试因此按新请求执行。删除没有成功时，同键请求到达、而本进程中已经没有该键的执行中请求（同一 `boot_id` 内以进程内的在途登记为准），服务端先删除这条记录，再按新请求执行 |
+| 崩溃恢复 | 守护进程启动时，处理所有 `boot_id` 不是本次启动的 `in_progress` 记录。资源变更与 `completed` 记录在同一事务中提交，所以这类记录背后必然**没有任何已提交的变更**；服务端删除它们，之后的同键重试按新请求执行，并且只执行一次。**批量调档除外**：已经提交了批次计划的 `in_progress` 记录背后可能有已生效的项，恢复流程不删除它，而是按计划只处理尚未完成的项，再写最终记录（[§10.7](#107-批量调档-post-v0runsbatch-adjust)）；还没有提交批次计划的，与其他操作一样删除。`in_progress` 记录**不受窗口过期影响**，只由这一恢复流程或上面的「回滚后清除」清除 |
 | 窗口 | **24 小时**，从记录变为 `completed` 的提交时刻起算（实例可配置，但不得少于 24 小时）。窗口内的同键请求按上面的规则回放或冲突 |
 | 永久保留类 | [§5](#5-操作清单) 中标为「必须·永久」的操作（创建任务、追加 run、续做、发消息、批量调档、记录裁决、追加台账）不受资源状态保护，过期后重放就会再执行一次，因此它们的记录**永不过期**。实例清理数据时，必须为它们保留 `{作用域, 指纹, 结果资源 ID}` 墓碑。这几类操作的重试在任何时候都不会重复执行 |
 | 窗口过期后（其余操作） | 记录失效，同键请求按新请求处理。其余操作（取消、暂停、完成、任务关闭、任务取消、`release-worktree`）都受资源状态保护：过期后重放不会再执行一次，但可能返回 `409 invalid_state`，而不是首次的响应。客户端应当按资源当前状态判断结果。这就是 24 小时窗口的保障边界 |
@@ -181,7 +181,7 @@ must-ignore **不适用于请求**。服务端严格校验请求体：请求中�
 
 保证只覆盖单个响应。分页列表的不同页、或者多个不同端点的响应，各自的 n 不同，不能直接拼成一个一致快照。客户端组合多个快照时，必须按 [§13.6](#136-快照与订阅衔接算法) 处理：从所有快照中最小的 `Event-Seq` 开始订阅（[§13](#13-事件订阅sse)），再按资源的 `version` 逐资源合并，丢弃不比本地版本新的事件内容。
 
-可变资源（Task、Run、Approval）都带 `version`，相关事件的 `data.version` 是事件发生后该资源的版本（[§13.4](#134-事件类型)）。只增资源（Ruling、Journal、Event）按 ID 去重合并。Capabilities 以 `ETag` 作为版本。
+可变资源（Task、Run、Approval、Ruling）都带 `version`，相关事件的 `data.version` 是事件发生后该资源的版本（[§13.4](#134-事件类型)）。Ruling 的内容写入后不变，但 `status` 会由 `effective` 变为 `superseded`，因此按可变资源合并。只增资源（Journal、Event）按 ID 去重合并。Capabilities 以 `ETag` 作为版本。
 
 ### 2.9 请求追踪
 
@@ -273,7 +273,7 @@ Instance
 | Task | 客户端创建，可改 `budget`、`title` | 一组 run 的容器，也是预算与汇总的单位（R12、R13） |
 | Run | 客户端创建；开工前可 `PATCH`；之后只经控制操作改变 | 调度与执行的最小单位。终态 run 永不再执行（R15） |
 | Result / Verdict | 只读 | run 的产出，绑定 SHA |
-| Ruling | 只增 | 主管对某个 SHA 的裁决 |
+| Ruling | 只增，`status` 可变 | 主管对某个 SHA 的裁决。内容写入后不变；`status` 只会由 `effective` 变为 `superseded`，每次变化 `version` 加 1（[§11.4](#114-主管裁决-post-v0taskstask_idrulings)） |
 | Journal | 只增 | 结构化台账条目 |
 | Approval | 服务端派生 | 由 run 状态推导出的待决事项；对 run 执行相应操作后自动关闭 |
 | Event | 只增 | 全局事件流 |
@@ -355,7 +355,7 @@ scope 含义见 [§16.2](#162-令牌作用域)。「幂等键」列为「必须�
 | `protocol_version` | string | 是 | 与该 runner 协商好的 Runner Protocol 版本 |
 | `impl_version` | string | 是 | runner 实现（bridge）版本 |
 | `native_version` | string\|null | 是 | 底层 CLI 版本；取不到时为 `null` |
-| `admission` | object | 是 | **【原则 P4】** 报告身份与 runner 级准入状态：`{status, suite, suite_version, protocol_version, report_sha256, artifact_sha256, profiles: [...], revalidate_required, revalidate_deadline, safety_capabilities, suspended_at, admitted_at}`。`status` 取 `admitted` 或 `suspended`。`revalidate_required` 为 `true` 表示原生工具版本已漂移：此时 `safety_capabilities` 为 `suspended`，强制只读与运行期禁止事项按未声明处理，直到重测通过；`revalidate_deadline` 之前没有重测通过，准入转 `suspended`。见 Runner Protocol §16.6 |
+| `admission` | object | 是 | **【原则 P4】** 报告身份与 runner 级准入状态：`{status, suite, suite_version, protocol_version, report_sha256, artifact_sha256, profiles: [...], revalidate_required, revalidate_deadline, safety_capabilities, suspended_at, admitted_at}`。`status` 取 `admitted` 或 `suspended`。`profiles` 是报告中各能力集合已通过的档案 ID 的并集，仅供展示；账号能否调度按它自己的能力集合逐类核验（AccountEntry `admission`，Runner Protocol §16.6）。`revalidate_required` 为 `true` 表示原生工具版本已漂移：此时 `safety_capabilities` 为 `suspended`，强制只读与运行期禁止事项按未声明处理，直到重测通过；`revalidate_deadline` 之前没有重测通过，准入转 `suspended`。见 Runner Protocol §16.6 |
 | `health` | object | 是 | `{status, components[]}`。`status` 取 `healthy`、`degraded`、`down`、`unknown` 之一；`components[]` 形如 `{id: "auth" 或 "gateway" 或 "upstream" 或 "access", status, checked_at, detail}`（R11：网关健康单独列出；`access` 表示地区或准入限制，Runner Protocol §13.3） |
 | `features` | object | 是 | runner 级**基线**，与 Runner Protocol §6.2 的 `features` 同构，由服务端原样转述（下文示例为节选）。不直接用于校验，见上文三层说明 |
 | `accounts` | AccountEntry[] | 是 | 该 runner 下运维配置、且已准入的账号 |
@@ -562,7 +562,7 @@ scope 含义见 [§16.2](#162-令牌作用域)。「幂等键」列为「必须�
 | 档位别名 | `@low`、`@mid`、`@high` | 可以写在 `model` 字段，在派单时解析为所选账号该档 `preferred_for_tier` 的模型。【设计决定 SD-06】 |
 | 思考强度阶梯 `effort_ladder` | `minimal` < `low` < `medium` < `high` < `xhigh` < `max` | 归一化强度。各模型只支持其中一部分，映射到 runner 原生取值由 Runner Protocol §6.3 定义。【设计决定 SD-06】 |
 | 特殊强度 `default` | `default` | 不在阶梯内，表示「不调强度、由 runner 自定」。只能用于 `efforts` 含 `default` 的模型；批量调档会跳过它（P1：没有强度控制的 runner 不得虚报档位） |
-| 角色 `role` | `dev`、`review`、`audit`、`design`、`integrate` | R14。R23 提到的「验收 run」不在 R14 的角色表中，本文暂归 `audit`（待主管确认） |
+| 角色 `role` | `dev`、`review`、`audit`、`design`、`integrate` | R14。R23 提到的「验收 run」不在 R14 的角色表中，归入 `audit`，不新增角色（主管已裁决：v0.1 设计单裁决第 6 条） |
 | 级别 `level` | `L1` < `L2` < `L3` < `L4` | 规范性定义见 [§7.3](#73-级别与动作风险)。`L1`–`L3` 是 run 的执行形态；`L4` 是人工批准动作级，0.2 中不可提交 |
 | L4 动作 `l4_actions` | `push`、`write_base_branch`、`deploy`、`modify_secrets` | 需要人工批准的动作（[§7.3](#73-级别与动作风险)）。它们同时是禁止事项，对每个 run 强制生效 |
 | 禁止事项 `forbidden_actions` | `push`、`write_base_branch`、`deploy`、`modify_secrets`、`install_deps`、`network`、`write_outside_workspace` | 0.2 词汇。`write_base_branch` 指写本 run 分支以外的任何 ref（base 分支、`target_branch`、其他 run 的分支、tag、远端跟踪引用）。实例可以扩展，扩展项前缀为 `x-` |
@@ -573,7 +573,7 @@ scope 含义见 [§16.2](#162-令牌作用域)。「幂等键」列为「必须�
 
 ### 7.1 `POST /v0/tasks`
 
-R25 所说任务提交的调度参数，在本协议中对应：目标 `goal`、约束 `constraints`、级别 `level`、模型与思考强度（每个 run 的 `model`、`reasoning_effort`、`tier_rationale`）、预算 `budget`。另外还有附加调度字段 `runner`、`account`、`priority`、`depends_on`、`fallbacks`。计划中「五项调度参数即 R24 的五项决策权」的说法有歧义（列出的是六个名词，R24 也没有枚举「五项」），本文按上述字段全部落地，已提请主管澄清。
+R25 所说任务提交的调度参数，在本协议中对应：目标 `goal`、约束 `constraints`、级别 `level`、模型与思考强度（每个 run 的 `model`、`reasoning_effort`、`tier_rationale`）、预算 `budget`。另外还有附加调度字段 `runner`、`account`、`priority`、`depends_on`、`fallbacks`。计划原文「五项调度参数即 R24 的五项决策权」的歧义已由主管裁决（v0.1 设计单裁决第 1 条）：五项调度决策权是 `runner`、`account`、`model`、`reasoning_effort`、`budget`，目标、约束、级别是任务属性；计划 R25 文案已据此修正。本文的字段落地不变。
 
 **TaskCreate**
 
@@ -741,7 +741,7 @@ R25 所说任务提交的调度参数，在本协议中对应：目标 `goal`、
 | `LEVEL_INSUFFICIENT` | policy | run 形态需要的级别高于 `task.level` |
 | `FORBIDDEN_UNENFORCEABLE` | policy | 某个禁止事项要求运行期执行（`enforcement: runtime`），但框架层和 runner 层（`forbidden_enforcement`）都没有 **enforced** 级机制能拦（R21；两层的分工与保证等级见 Runner Protocol §12.3。例如 `network` 只能由 runner 层拦截；钩子、环境限制只算 advisory，事后核对只算 audit） |
 | `BUDGET_BACKSTOP_REQUIRED` | policy | 任务或 run 设了 token 或成本上限，而目标用量非流式（或未知），却没有实际生效的硬兜底：目标支持 `limits.max_steps` 时须有 `max_steps`，否则 `timeouts.total_s` 须非空（[§7.8](#78-预算与时钟的执行规则)） |
-| `BUDGET_EXHAUSTED` | policy | `continue` 时任务或继承的 run 预算已无剩余额度（[§7.8](#78-预算与时钟的执行规则)） |
+| `BUDGET_EXHAUSTED` | policy | `continue` 时任务或继承的 run 预算已无剩余额度；或向任务预算已无剩余额度的任务追加 run（[§7.8](#78-预算与时钟的执行规则)） |
 | `REHOME_INVALID` | dependency | `continue` 的 `rehome_dependents` 改写某个下游后，该下游重新校验不通过（成环、跨项目、主体无权限等，附带嵌套违规；[§10.3](#103-续做-post-v0runsrun_idcontinue)） |
 | `REVIEW_SUBJECT_REQUIRED` | review | review/audit 缺 `review_of` |
 | `REVIEW_SUBJECT_ROLE` | review | 被审 run 的角色不是 dev、design 或 integrate |
@@ -884,7 +884,7 @@ Content-Type: application/json
 
 | 层 | 额度来源 | 计量范围 | 超限时 |
 |---|---|---|---|
-| 任务 | TaskBudget：`tokens`、`estimated_cost_usd` | 任务内全部 run 的 `budget_tokens` 与估算成本之和 | 任务内的 run 全部转 `paused`（`budget_exceeded`），调度器不再为该任务启动任何段 |
+| 任务 | TaskBudget：`tokens`、`estimated_cost_usd` | 任务内全部 run 的 `budget_tokens` 与估算成本之和 | 任务内的**非终态** run 转 `paused`（`budget_exceeded`）：`running`、`waiting` 的经 `budget` 停止请求（T15），未开工的直接转（T16）；结局候选已锁定、正在收尾的 run 按候选收尾（[§9.6](#96-停止请求完成候选与收尾)）；终态 run 不受影响。调度器不再为该任务启动任何段 |
 | run | RunBudget：`tokens`、`estimated_cost_usd`、`max_steps`；以及 `timeouts.total_s` | 本 run 全部段之和 | token 或成本超限：转 `paused`（`budget_exceeded`）；步数用尽：转 `paused`（`step_limit_reached`）；`total_s` 用尽：转 `interrupted`（`timeout_total`） |
 | 段 | 宿主下发给 runner 的 `limits`（Runner Protocol §9.2） | 本段 | runner 执行步数上限；宿主执行各类时长 |
 
@@ -892,7 +892,8 @@ Content-Type: application/json
 - **跨 run（续做）**：`resume` 与 `takeover` 产生的新 run，缺省继承源 run（连同其续做链）RunBudget 与 `total_s` 的**剩余额度**；`rework` 是新一轮工作，缺省按源 run 的 RunBudget 配置重新计额。`overrides.budget`、`overrides.timeouts` 可以显式改写。任务预算始终跨 run 累计。
 - **步的定义**：一步是一次模型调用，即向模型发出一次请求并收到一次响应，包括只返回工具调用请求的响应。一步之内可以有多次工具调用，工具调用不计步；交互轮次（主管消息的往返）也不计步。runner 依据原生证据回报 `steps`，取不到时为 `null`。`steps` 为 `null` 的目标不能用步数作硬兜底。
 - **执行**：用量流式的目标，每次用量更新都核算一次，越过上限即发出 `budget` 停止请求，越界部分至多是一步的用量。用量非流式或未知的目标在段结束时核算，运行中靠硬兜底：目标支持 `limits.max_steps` 时用步数，否则用 `timeouts.total_s`。设有 token 或成本上限、而硬兜底不能实际生效时，提交被拒（`BUDGET_BACKSTOP_REQUIRED`）。
-- **预算仍超限不得恢复执行**：`continue`、resume 方式下的消息投递、调度器启动新段之前，都要检查任务与 run 的剩余额度。没有剩余额度时：`continue` 返回违规 `BUDGET_EXHAUSTED`；待投递的消息继续保持待投递，run 转 `paused`（`budget_exceeded`）。
+- **核算先于结局候选**：每次核算都在宿主消费该回报的事务中进行，并且先于登记结局候选。由 `run.finished` 的最终回执首次暴露的超限（非流式目标的常见情形），在同一事务中先提交 `budget` 停止请求，结局按 [§9.6](#96-停止请求完成候选与收尾) 的「停止请求先提交」裁定：run 转 `paused`（`budget_exceeded`），不转 `done`，已完成的工作照常以 WIP 保全。
+- **预算仍超限不得恢复执行**：`continue`、追加 run、resume 方式下的消息投递、调度器启动新段之前，都要检查任务与 run 的剩余额度。没有剩余额度时：`continue` 与追加 run 返回违规 `BUDGET_EXHAUSTED`；有待投递消息的 run 不投递，服务端提交 `budget` 停止请求，run 转 `paused`（`budget_exceeded`），待投递的消息与其他停止请求一样作废（[§9.6](#96-停止请求完成候选与收尾)，记入台账）。作废的消息不会转给之后 `continue` 产生的新 run；需要时，主管把它写进 `continue` 的 `notes`，或在新 run 进入 `waiting` 后重新发送。
 
 **时钟**
 
@@ -922,7 +923,7 @@ Content-Type: application/json
 | `tier_rationale` | string | |
 | `priority`、`critical`、`depends_on`、`interaction`、`on_interrupt`、`timeouts`、`budget` | — | 回显（`PATCH` 后为新值） |
 | `base` | object | 请求的基点，外加 `sha`（开工时解析出的 40 位 SHA）与 `resolved_at` |
-| `workspace` | object | `{mode, branch, retention}`。`branch` 是 run 分支，形如 `mac/run_…`；`retention` 是 `{protected, reclaim_after, reclaimed_at}` |
+| `workspace` | object | `{mode, branch, retention}`。`branch` 是 run 分支，形如 `mac/run_…`；`retention` 是 `{protected, reclaim_after, reclaimed_at, release}`；`release` 是 `release-worktree` 的持久释放状态，没有请求过时为 `null`（[§10.8](#108-释放-worktree-post-v0runsrun_idrelease-worktree)） |
 | `policy` | object | `{read_only, read_only_hard, toolchain_write, forbidden[], forbidden_guarantee}`：生效的策略，即项目禁止事项、L4 动作与 run 请求的合并结果。`forbidden_guarantee` 形如 `{"push": ["advisory"]}`，按选定目标如实给出每个禁止事项在运行期实际具备的保证等级集合，元素取 `enforced`、`advisory`、`audit`（Runner Protocol §12.3）；只有含 `enforced` 的才算运行期强制 |
 | `degraded` | Degrade[] | 在选定目标上实际生效的降级（P1，[§7.4](#74-能力降级授权p1)）；未派单时为 `[]` |
 | `waivers` | Waiver[] | |
@@ -1008,7 +1009,7 @@ Content-Type: application/json
   "workspace": {
     "mode": "worktree",
     "branch": "mac/run_01JDR3K9A2B3C4D5E6F7G8H9J0",
-    "retention": { "protected": false, "reclaim_after": null, "reclaimed_at": null }
+    "retention": { "protected": false, "reclaim_after": null, "reclaimed_at": null, "release": null }
   },
   "policy": {
     "read_only": false, "read_only_hard": false, "toolchain_write": false,
@@ -1076,9 +1077,9 @@ Content-Type: application/json
 
 | # | 从 | 到 | 触发 |
 |---|---|---|---|
-| T1 | （新建） | `queued` | 校验通过且依赖就绪 |
+| T1 | （新建） | `queued` | 校验通过，按归位规则就绪：依赖都已 `done`，并且有合法目标 |
 | T2 | （新建） | `blocked` | 依赖未就绪（含 `base.kind: run` 或 `review_of` 隐含的依赖） |
-| T3 | `blocked` | `queued` | 全部依赖 `done`；或 `PATCH`、rehome 之后按归位规则就绪 |
+| T3 | `blocked` | `queued` | 按归位规则就绪：全部依赖 `done`，并且有合法目标（依赖自然完成，或 `PATCH`、rehome 之后） |
 | T4 | `queued` | `leasing` | 被调度选中且需要租约 |
 | T5 | `queued`、`leasing` | `running` | 在**同一事务**中拿到租约（如需要）、预留容量（[§9.1](#91-状态表) 计槽规则），并提交该段的持久启动意图（Runner Protocol §9.3）。从这一刻起 run 计为在跑，即使进程尚未拉起 |
 | T6 | `queued`、`leasing` | `held` | 没有可用目标：账号冻结、不健康、准入失效或地区受限，且没有合法 fallback；租约等待中目标失效也走这里（同时放弃租约等待） |
@@ -1095,16 +1096,17 @@ Content-Type: application/json
 | T17 | — | — | （0.2 删除。暂停的 run 一律经 T18 由新 run 恢复，原 run ID 不再回到调度） |
 | T18 | `paused` | `interrupted` | 主管 `continue`（`resume`）：在同一事务中，原 run 以 `superseded` 终结并新建续做 run。不论原 run 是否开工 |
 | T19 | 任一非终态 | `cancelled` | 主管取消（running 时按 [§9.6](#96-停止请求完成候选与收尾) 停止；与完成、暂停、超时的竞争也按该节裁定） |
-| T20 | `queued`、`held` | `blocked` | `PATCH` 或 rehome 之后按归位规则：依赖中出现了未 `done` 的 run |
-| T21 | `blocked` | `held` | `PATCH` 或 rehome 之后按归位规则：依赖都已 `done`，但没有合法目标 |
+| T20 | `queued`、`held` | `blocked` | 按归位规则（`PATCH`、rehome 之后，或依赖、目标状态变化时）：依赖中出现了未 `done` 的 run |
+| T21 | `blocked` | `held` | 按归位规则（依赖自然完成，或 `PATCH`、rehome 之后，或目标状态变化时）：依赖都已 `done`，但没有合法目标。依赖完成时目标账号仍冻结的 run 直接转 `held`，不经过 `queued` |
+| T22 | （新建） | `held` | 校验通过，依赖都已 `done`，但创建时按归位规则没有合法目标（比如目标账号处于冻结中，且没有合法 fallback） |
 
-**归位规则**：未开工的 run（`queued`、`blocked`、`held`）在创建、`PATCH`、rehome 之后，以及依赖或目标状态变化时，按下面的优先级重新推导状态：依赖中有未 `done` 的 run（不论是还没结束还是以非 `done` 结束）→ `blocked`；否则没有合法目标 → `held`；否则 → `queued`。推导结果与当前状态不同时，按 T3、T6、T7、T20、T21 之一迁移。`leasing` 不能 `PATCH`；`paused` 只能经 `continue` 或 `cancel` 离开。
+**归位规则**：未开工的 run（`queued`、`blocked`、`held`）在创建、`PATCH`、rehome 之后，以及依赖或目标状态变化时，按下面的优先级重新推导状态：依赖中有未 `done` 的 run（不论是还没结束还是以非 `done` 结束）→ `blocked`；否则没有合法目标 → `held`；否则 → `queued`。创建时按 T1、T2、T22 之一直接进入推导出的状态；之后推导结果与当前状态不同时，按 T3、T6、T7、T20、T21 之一迁移。「依赖状态变化」指依赖结束（`done` 或以非 `done` 结束）；「目标状态变化」指账号冻结与解除、健康、准入与地区限制的变化。`leasing` 不能 `PATCH`；`paused` 只能经 `continue` 或 `cancel` 离开。
 
 补充语义：
 
 - **依赖者不连带**：上游以非 `done` 结束时，下游保持 `blocked`（`dependency_failed`）并打开 `blocked_run` 审批，不连带取消（计划 §3）。只有 `cancel` 的 `cascade: true` 会连带取消。
 - **终态不可续会话**：终态 run 永不再调度、永不复用 runner 会话（R15、A-015）。续做只会产生新 run。
-- **内存护栏归 paused，超时归 interrupted**：计划 §3 把「护栏」列在 paused 名下，同时规定超时后转 interrupted。本文据此把内存超限归为 `paused`（继续跑之前要人决定，比如调整任务拆分），把各类超时归为 `interrupted`。【设计决定 SD-15 · 待确认】
+- **内存护栏归 paused，超时归 interrupted**：计划 §3 把「护栏」列在 paused 名下，同时规定超时后转 interrupted。本文据此把内存超限归为 `paused`（继续跑之前要人决定，比如调整任务拆分），把各类超时归为 `interrupted`。【设计决定 SD-15 · 主管已裁决采纳（v0.1 设计单裁决第 3 条）】
 - **终态只提交一次**：完成、停止、超时都先作为候选，收尾结束后才提交最终状态（[§9.6](#96-停止请求完成候选与收尾)）。因此收尾中发现的协议违规、交付物不合法或保全失败，都能在提交前改变结局，不会出现终态之间的迁移。
 
 ### 9.3 状态 × 操作矩阵
@@ -1127,7 +1129,7 @@ Content-Type: application/json
 
 矩阵之外的附加条件：
 
-- `running` 或 `waiting` 的 run 处于收尾（`finalizing: true`）时，`pause`、`messages`、`complete` 返回 `409 invalid_state`（`details.phase: "finalizing"`）；`cancel` 只在停止竞争规则允许时生效（[§9.6](#96-停止请求完成候选与收尾)）。
+- `running` 或 `waiting` 的 run 处于收尾（`finalizing: true`）时，`messages`、`complete` 返回 `409 invalid_state`（`details.phase: "finalizing"`）；`cancel`、`pause` 按停止竞争表处理（[§9.6](#96-停止请求完成候选与收尾)）：完成或失败候选之后返回同样的 `409`，`awaiting_input` 候选收尾期间提交并排队。
 - 任务为 `closed` 或 `cancelled` 时，对其中的 run 调用 `continue` 返回 `409 invalid_state`（`details.task_state`）。已关闭、已取消任务中的工作不能续做；要继续，就新建任务。
 - 源 run 的保全失败（`result.preservation.state: failed`）时，`resume`、`takeover` 返回 `409 preservation_failed`（[§9.6](#96-停止请求完成候选与收尾)）。
 
@@ -1151,7 +1153,7 @@ Content-Type: application/json
                                            ▲                 │
                                            └──────T18────────┘   (任一非终态 ─T19─▶ cancelled)
 
- 图中省略：归位迁移 T20（queued/held → blocked）、T21（blocked → held），以及 T6 的 leasing → held。T17 已删除。
+ 图中省略：归位迁移 T20（queued/held → blocked）、T21（blocked → held）、T22（新建 → held），以及 T6 的 leasing → held。T17 已删除。
 ```
 
 ### 9.5 WIP、最终提交与 worktree 保留（R9）
@@ -1178,24 +1180,28 @@ Content-Type: application/json
 
 | 先提交的 | 后到的 | 结局 |
 |---|---|---|
-| 停止请求 | 结局候选（任何 outcome） | 按停止请求的种类：`cancel` → `cancelled`；`pause`、`budget`、`guard` → `paused`；`timeout` → `interrupted`。runner 已经完成的工作照常保全（WIP 提交），但不转 `done`，也不做交付物校验 |
-| 结局候选 `completed` | 停止请求 | 停止请求不生效：返回 `409 invalid_state`（`details.phase: "finalizing"`），按候选收尾 |
-| 结局候选 `failed` | 停止请求 | 停止请求不生效，同上 |
-| 结局候选 `awaiting_input` | 停止请求 | 先按候选收尾进入 `waiting`；之后再到的停止请求按 `waiting` 状态处理 |
+| 停止请求 | 结局候选（任何 outcome） | 按停止请求的种类：`cancel` → `cancelled`；`pause`、`budget`、`guard` → `paused`；`timeout` → `interrupted`。runner 已经完成的工作照常保全（WIP 提交），但不转 `done`，也不做交付物校验；候选的 outcome 与错误记入台账 |
+| 结局候选 `completed` | 停止请求 | 停止请求不改变结局：主管的 `cancel`、`pause` 返回 `409 invalid_state`（`details.phase: "finalizing"`），宿主内部的停止（`timeout`、`guard`、`budget`）不再提交；按候选收尾。端点进程的清退不受影响，见下文「物理清退」 |
+| 结局候选 `failed` | 停止请求 | 同上 |
+| 结局候选 `awaiting_input` | 停止请求 | 停止请求照常提交并返回 `202`（排队），不打断候选收尾。候选收尾提交 `waiting` 之后，排队的停止请求立即按 `waiting` 状态生效：这时没有进程（只有 resume 方式会以 `awaiting_input` 结束），不发信号，直接按停止种类收尾 |
 | 停止请求 A | 停止请求 B | 只保留一个：B 是 `cancel` 而 A 不是时，B 取代 A（主管显式取消最强）；其余情况 B 返回 `202` 和已有的 `stop_request`，不改变 A |
 
-停止请求提交时，尚未投递的消息一并作废（记入台账），不再投递。scope 内存触顶由内核直接 OOM kill，不经停止请求：进程没有发出 `run.finished` 就退出，按 Runner Protocol §9.7 判 `memory_limit`。
+**预算判定先于候选**：宿主消费 runner 回报（`usage` 事件或 `run.finished`）的事务中，先累计用量并做预算判定（[§7.8](#78-预算与时钟的执行规则)），再登记结局候选。由这条回报首次暴露的超限，如果该 run 还没有停止请求，就在同一事务中先提交 `budget` 停止请求、后登记候选，因此按上表第一行裁定。非流式目标在 `run.finished` 的最终回执中才发现超限，也是这样处理。
 
-**收尾**：最终状态只在下面四步都结束之后，用一个事务提交。收尾期间 run 保持原状态（`running` 或 `waiting`），`finalizing: true`，并继续占槽：
+停止请求提交时，尚未投递的消息一并作废（记入台账），不再投递。作废的消息不会转给之后经 `continue` 产生的新 run（[§7.8](#78-预算与时钟的执行规则)）。scope 内存触顶由内核直接 OOM kill，不经停止请求：进程没有发出 `run.finished` 就退出，按 Runner Protocol §9.7 判 `memory_limit`。
+
+**收尾**：最终状态只在下面四步都结束之后，用一个事务提交。收尾期间 run 保持原状态（`running` 或 `waiting`），`finalizing: true`，并**保留它已有的容量预留**（[§9.1](#91-状态表) 计槽规则）：`running` 与 stdin 方式的 `waiting` 继续占槽，直到最终状态提交时释放；没有进程、也没有预留的 run（resume 方式的 `waiting` 经 `complete` 或停止请求收尾）不为收尾取得容量，也不占槽：
 
 1. 端点输出读完：stdout 到达 EOF，所有完整行都已按 Runner Protocol §14 消费；
-2. 进程组与 scope 已确认为空，端点及其全部后代都已退出。收到 `run.finished` 不代表这一点；
+2. 进程组与 scope 已确认为空，端点及其全部后代都已退出。收到 `run.finished` 不代表这一点；端点不自行退出时按下文「物理清退」强制清退；
 3. 保全完成：正常完成做最终提交，停止或中断做 WIP 提交（取消且没有要求 `preserve_wip` 时不做），结果写入 `result.preservation`；
 4. 正常完成时，交付物校验完成（verdict 等）。
 
 收尾中发现的问题在提交之前改变结局：尾部出现协议违规 → `failed`（`protocol_violation`）；交付物不合法 → `failed`（`deliverable_invalid`）；保全失败 → 见下。最终状态只提交一次，不存在终态之间的迁移。
 
 **宽限期计时**：宽限期从宿主**实际发出停止信号**起算，即写出 `run.cancel` 或发送 SIGTERM 的时刻，记为 `stop_request.stop_sent_at`，并在活动流中插入 `mac.stop_sent`。时长为目标声明的 `cancel.grace_s`。到 `escalate_at = stop_sent_at + grace_s + 5` 秒进程组仍未退出时，宿主向整个进程组和 scope 发送 SIGKILL（Runner Protocol §9.5）。没有进程的 run（比如 resume 方式的 `waiting`）不发信号，直接进入收尾。
+
+**物理清退**：上面的竞争表只决定结局（逻辑结局竞争）；端点进程的清退（物理清退）独立进行，不因结局已锁定而停止，也不需要提交停止请求。结局候选提交后，宿主关闭端点的 stdin，以候选提交时刻加 10 秒为**退出期限**（Runner Protocol §9.6）。到期时端点仍未退出，或者端点已经退出、进程组或 scope 中却仍有后代进程（发现即处理，不等期限），宿主向整个进程组和 scope 发送 SIGTERM，5 秒后仍不为空即发送 SIGKILL。需要这样强制清退的段属于协议违规（Runner Protocol §13.5）：结局改为 `failed`（`protocol_violation`），候选的 outcome 记入台账；保全在进程组确认为空之后照常进行。停止请求先提交的 run 仍按上文的宽限期计时清退，结局按停止请求的种类。
 
 **保全失败**：最终提交或 WIP 提交失败（git 错误、磁盘满、残留 `index.lock`、`in_place` 恢复原 HEAD 失败等）时：
 
@@ -1259,11 +1265,15 @@ Content-Type: application/json
 | `depends_on` 含源 run | 换成新 run |
 | `base: {kind: "run", run_id: 源 run}` | `base.run_id` 换成新 run；基点在新 run 终态时解析 |
 | `review_of: {run_id: 源 run}`，没有显式给 `sha` | `review_of.run_id` 换成新 run；`sha` 在新 run 终态时解析 |
-| `review_of` 或 `integrate_sources[i]` 显式给了 `sha`（已绑定旧 SHA） | **不改写**，保持原样，记入响应的 `rehome.skipped[]`（`reason: "sha_pinned"`）。这些下游仍等待源 run，由主管决定 `PATCH` 或取消 |
+| `review_of` 或 `integrate_sources[i]` 显式给了 `sha`（已绑定旧 SHA） | **整项跳过**：该下游的任何字段都不改写（包括 `depends_on`、`base` 中对源 run 的引用），记入响应的 `rehome.skipped[]`（`reason: "sha_pinned"`，`fields` 列出固定了 SHA 的字段） |
+
+**优先级**：固定 SHA 优先于上表其他各行。一个下游只要有一处对源 run 的引用固定了 SHA，就整项跳过，不会出现「依赖已改向新 run、却仍审查或集成旧 SHA」的混合状态。被跳过的下游保持原样，依赖源 run 的结局照常决定它的归位：源 run 不以 `done` 结束时，它转为（或保持）`blocked`（`dependency_failed`），并打开 `blocked_run` 审批。`PATCH` 不能修改 `review_of`、`base`、`integrate_sources`（[§10.6](#106-调参-patch-v0runsrun_id)），要让这样的下游改为针对新 run，只能**取消它并重新提交**。
+
+**清除旧解析结果**：被改写的引用，连同由旧源 run 解析出的结果一起清除：`base.sha`、`base.resolved_at`，以及由服务端解析填入（不是客户端显式给出）的 `review_of.sha`，都置为 `null`，在新 run 终态时重新解析；`waiting_on` 按归位结果重新计算。
 
 改写后，每个下游按 [§7.5](#75-校验规则) 重新校验（依赖成环、跨项目、主体对其项目的授权都要检查）；任一下游不通过，整个 `continue` 以 `REHOME_INVALID` 拒绝。改写后的下游按 [§9.2](#92-状态迁移) 的归位规则重新归位。
 
-响应：`201 {"run": <新 run>, "source": {"id", "state", "version"}, "rehome": {"rehomed": [{"run_id", "fields", "version"}], "skipped": [{"run_id", "reason"}]}, "warnings": [...]}`。
+响应：`201 {"run": <新 run>, "source": {"id", "state", "version"}, "rehome": {"rehomed": [{"run_id", "fields", "version"}], "skipped": [{"run_id", "reason", "fields"}]}, "warnings": [...]}`。
 
 **上下文包预览** `GET /v0/runs/{run_id}/context-pack?mode=rework&verdicts=run_a,run_b`：
 
@@ -1333,6 +1343,7 @@ R24 × R13：预算告警或额度告急时，批量调整未开工 run 的档�
 - 只作用于未开工的 run（`paused` 只包括未开工的）。`include_critical: false` 时跳过 `critical` run（「关键路径保档」）。
 - `tier_delta`：别名按档位移动（`@high` 降一档变 `@mid`）；具体模型 ID 换成同 runner、同账号目录中目标档位的 `preferred_for_tier` 模型。`effort_delta`：在所选模型的 `efforts` 列表内按阶梯移动。到底或到顶的跳过。
 - 每个 run 单独校验，单独生效，**不是原子操作**（一个 run 失败不影响其他 run）。【设计决定 SD-17】
+- **批次计划与逐项进度**（P3，[§2.6](#26-提交幂等p3)）：实跑（`dry_run: false`）时，服务端先在一个事务中按 `filter` 求出目标集合，把它连同 `adjust` 与 `tier_rationale` 作为**批次计划**写入本请求的幂等记录（记录仍为 `in_progress`）。目标集合从此固定，之后新出现的匹配 run 不加入。随后逐个处理目标：对一个 run 的校验、改档（版本加 1，发 `run.updated`）与该项进度（`adjusted`，或 `skipped` 及 `reason`）在**同一事务**中提交。全部目标都有了进度之后，按各项进度组装响应，在一个事务中把记录置为 `completed`。批次计划提交之后，这个请求一定会被推进到 `completed`：当前进程中断时，由守护进程重启后的恢复流程接着处理，**只处理进度中尚未完成的项**，已完成的项不会再执行；恢复时每项照常重新校验，状态已变的记 `state_changed`。在记录置为 `completed` 之前，同键请求得到 `409 idempotency_in_progress`。`dry_run: true` 不改任何 run，在一个事务中求出结果并按普通请求记录。
 
 响应 `200`：
 
@@ -1366,12 +1377,13 @@ R9：WIP 必须由主管确认保全落点后才能清理。
 
 **核验与删除防并发**：
 
-1. 请求事务内核验上表条件，记下 run 分支 tip `T`、`wip_sha` 与 `ref` 当时的 SHA `K`，并提交「释放意图」（含 `T`、`K`）。删除本身是外部副作用，不在请求事务内执行（[§2.6](#26-提交幂等p3)）。
-2. 宿主在实例对该仓库的 git 互斥锁内执行释放：先用比较后删除（`git update-ref -d refs/heads/mac/<run_id> T`）删除 run 分支，分支在核验之后被移动过时删除失败，整个释放中止，什么都不删，结果为 `409 version_conflict`；分支删除成功后，再删除 worktree 目录。两步都可以安全重做，守护进程崩溃后由恢复流程按释放意图继续。
-3. 核验记录 `{T, wip_sha, ref, K}` 记入台账与响应的 `verified`。`ref` 不在框架控制之下：框架之后从不改写或删除它，但不能阻止人删除它；台账中的 `K` 用于事后核对。
+1. 请求事务内核验上表条件，记下 run 分支 tip `T`、`wip_sha` 与 `ref` 当时的值 `K`，并提交「释放意图」（含 `T`、`K`；`discard` 没有 `K`）。删除本身是外部副作用，不在请求事务内执行（[§2.6](#26-提交幂等p3)）。
+2. 宿主在实例对该仓库的 git 互斥锁内执行释放：先用**一个 Git 引用事务**（`git update-ref --stdin`，其中的命令全部生效或全部不生效）同时核对保全 `ref` 仍为 `K`（`verify <ref> K`），并以比较后删除的方式删除 run 分支（`delete refs/heads/mac/<run_id> T`）。保全 `ref` 在核验之后被移动或删除，或者 run 分支被移动，引用事务整体失败，什么都不删：释放中止，分支与目录都保留。引用事务成功后，再删除 worktree 目录。`discard` 的引用事务只有比较后删除。两步都可以安全重做，守护进程崩溃后由恢复流程按释放意图继续（引用事务已经成功的，只补删目录）。
+3. 核验记录 `{T, wip_sha, ref, K}` 记入台账与响应的 `verified`。`ref` 不在框架控制之下：框架从不改写或删除它。删除 run 分支时，引用事务已经原子地核对它仍为 `K`；释放完成之后人再删除它，框架无法阻止，台账中的 `K` 用于事后核对。
 4. **保全未完成时不删目录**：`result.preservation.state` 为 `failed` 的 run，目录中可能有未进入任何提交的工作。这时只接受 `discard`，或者在人工把工作提交到 `ref` 并清理目录之后，用 `reachable_from` 释放（目录必须干净，见上表）。`in_place` 的 run 在释放完成时一并释放仓库根租约。
+5. **释放状态**：释放意图提交之后，执行中的失败不再以 HTTP 错误表达，而是记入持久的释放状态 `workspace.retention.release = {state, requested_at, released_at, error}`：`state` 取 `pending`（意图已提交、仍在执行）、`completed`（分支与目录都已删除）或 `aborted`（引用事务失败，什么都没删；`error.reason` 取 `preservation_ref_changed` 或 `run_branch_moved`）。每次变化都发 `run.updated` 并记入台账；受保护的 run 释放中止时，打开 `worktree_release` 审批（[§12](#12-审批收件箱)）。
 
-成功时返回 `200 {"release": {"state", "released_at"}, "verified": {...}}`。`state` 为 `completed`（已删除）或 `pending`（释放意图已提交、仍在执行），后者完成时发 `run.updated`（`workspace.retention.reclaimed_at`）。同时关闭对应审批，并记入台账。只适用于终态 run；`paused` 的 run 要先取消。已经释放（或释放意图已提交）的 run 再次释放，返回 `409 invalid_state`（`details.reason: "already_released"`），不会重复删除。
+核验通过、释放意图提交时返回 `200 {"release": {...}, "verified": {...}}`，`release` 是意图提交时的释放状态（`state: "pending"`）；之后转为 `completed`（同时填 `workspace.retention.reclaimed_at`）或 `aborted` 时发 `run.updated`。同键重试回放这个 `200`，不会因为之后的执行结果变成 HTTP 错误；当前结果以 run 资源上的 `workspace.retention.release` 为准。同时关闭对应审批，并记入台账。只适用于终态 run；`paused` 的 run 要先取消。释放已完成或仍在执行时再次释放，返回 `409 invalid_state`（`details.reason: "already_released"`），不会重复删除；上一次释放为 `aborted` 时，可以用新的幂等键重新请求，服务端重新核验。
 
 ## 11. 结果、审查结论与裁决
 
@@ -1588,7 +1600,7 @@ R16：主管裁决单独成条，与审查结论分开。
 | `expected_branch_version` | int | 否 | 客户端作决定时看到的分支版本。给出且与当前版本不同，返回 `409 version_conflict` |
 | `note` | string（≤8 KiB） | 否 | |
 
-上述核对（候选、结论有效性、分支版本）与裁决的写入在**同一事务**中完成，检查与生效之间没有窗口。响应 `201` 返回 Ruling：`{id, object: "ruling", task_id, subject, branch: {id, version}, decision, based_on, note, by, at, status}`，`status` 取 `effective` 或 `superseded`；分支版本变化时裁决变为 `superseded`。同时发 `ruling.recorded` 事件。裁决本身不触发任何执行；返工仍由客户端显式调用 `continue`（机制与策略分离）。
+上述核对（候选、结论有效性、分支版本）与裁决的写入在**同一事务**中完成，检查与生效之间没有窗口。响应 `201` 返回 Ruling：`{id, object: "ruling", task_id, subject, branch: {id, version}, decision, based_on, note, by, at, status, version}`，`status` 取 `effective` 或 `superseded`；分支版本变化时裁决变为 `superseded`。顶层 `version` 是 Ruling 自身的版本（与 `branch.version` 无关）：创建时为 1，变为 `superseded` 时加 1，供客户端按版本合并（[§13.6](#136-快照与订阅衔接算法)）。同时发 `ruling.recorded` 事件。裁决本身不触发任何执行；返工仍由客户端显式调用 `continue`（机制与策略分离）。
 
 **裁决不是 L4 批准**：`accept` 裁决只表示主管接受这个 SHA 作为任务结果，不授权合并、推送或部署（[§7.3](#73-级别与动作风险)）。
 
@@ -1617,7 +1629,7 @@ R16：主管裁决单独成条，与审查结论分开。
 | `paused_run` | run 进入 `paused` | `continue`（`mode: resume`）或 `cancel` |
 | `held_run` | run 因 `no_legal_target` 进入 `held`（单纯的限额冻结会自动解除，不打开） | `PATCH`（placement 或 fallbacks）或 `cancel` |
 | `blocked_run` | 依赖以非 `done` 结束 | `PATCH depends_on`、`continue` 上游（`rehome_dependents`）或 `cancel` |
-| `worktree_release` | 受保护的 run 过了保留期 | `release-worktree`；不处理就继续保留 |
+| `worktree_release` | 受保护的 run 过了保留期，或它的释放中止（[§10.8](#108-释放-worktree-post-v0runsrun_idrelease-worktree)） | `release-worktree`；不处理就继续保留 |
 
 **Approval 对象**
 
@@ -1704,14 +1716,14 @@ data: {"type":"stream.reset","ts":"2026-12-20T08:00:00.000Z","data":{"complete_f
 
 ### 13.4 事件类型
 
-修改资源的事件（`task.*`、`approval.*`，以及除 `run.activity` 之外的全部 `run.*`）的 `data` 都带 `version`：事件发生后该资源的版本，供逐资源合并（[§13.6](#136-快照与订阅衔接算法)）。这类修改（包括用量更新）都会使资源版本加 1。
+修改资源的事件（`task.*`、`approval.*`、`ruling.*`，以及除 `run.activity` 之外的全部 `run.*`）的 `data` 都带 `version`：事件发生后该资源的版本，供逐资源合并（[§13.6](#136-快照与订阅衔接算法)）。这类修改（包括用量更新）都会使资源版本加 1。
 
 | 类型 | 触发 | `data` 主要字段 | 缺省订阅 |
 |---|---|---|---|
 | `task.created` / `task.updated` | 任务创建或修改 | `task`（快照） | 是 |
 | `task.closed` / `task.cancelled` | 任务关闭或取消 | `outcome` | 是 |
 | `run.created` | run 创建 | `run`（快照） | 是 |
-| `run.updated` | `PATCH`、批量调档、`rehome_dependents`、消息投递、谱系候选变化、worktree 释放完成 | `changes`（字段前后值）、`by` | 是 |
+| `run.updated` | `PATCH`、批量调档、`rehome_dependents`、消息投递、谱系候选变化、worktree 释放状态变化（完成或中止） | `changes`（字段前后值）、`by` | 是 |
 | `run.state_changed` | 任一状态迁移 | `from`、`to`、`reason`、`occupies_slot`、`wip_sha`、`waiting_on` | 是 |
 | `run.stop_requested` | 发出停止请求 | `stop_request` | 是 |
 | `run.model_effective` | runner 首次（或再次）回报实际生效的模型或强度 | `model`、`reasoning_effort`（三段）、`mismatch` | 是 |
@@ -1720,7 +1732,7 @@ data: {"type":"stream.reset","ts":"2026-12-20T08:00:00.000Z","data":{"complete_f
 | `run.activity` | runner 归一化活动（消息、工具调用摘要等） | `segment`、`run_seq`、`event`（见 §13.7） | **否** |
 | `verdict.validated` | review/audit 的 verdict 校验完成 | `valid`、`overall`、`reviewed`、`errors` | 是 |
 | `verdict.superseded` | 审查结论失效 | `review_run_id`、`reviewed`、`superseded_by` | 是 |
-| `ruling.recorded` / `ruling.superseded` | 裁决记录或失效 | `ruling` | 是 |
+| `ruling.recorded` / `ruling.superseded` | 裁决记录或失效 | `ruling`（快照）、`version` | 是 |
 | `approval.opened` / `approval.resolved` | 审批打开或关闭 | `approval` | 是 |
 | `alert` | 告警 | `alert_id`、`kind`、`severity`、`subject`、`message`、`detail` | 是 |
 | `capabilities.changed` | 目录、健康、额度或准入变化 | `changed`（`runner`、`account`、`fields`） | 是 |
@@ -1786,7 +1798,7 @@ on disconnect: reconnect with Last-Event-ID: last_seq（指数退避 + 抖动）
 
 - 从所有快照中**最小**的 `Event-Seq` 订阅，保证任一快照之后发生的变化都会收到；再逐资源比较版本，保证晚到的旧事件不会覆盖较新的快照内容。
 - 快照覆盖哪些资源由客户端决定：客户端要维护的资源都必须出现在 resync 的快照集合中，集合之外的资源只能靠事件建立。分页期间新建的资源，其 `*.created` 事件的序号必然大于 s0，所以不会遗漏。
-- 只增资源（Ruling、Journal）按 ID 去重；没有 `version` 的事件（`alert`、`capabilities.changed` 等）总是应用；Capabilities 用条件 GET 刷新。
+- 只增资源（Journal）按 ID 去重。Ruling 按 `version` 合并，与其他可变资源相同：快照中 `effective` 的裁决收到同 ID、版本更新的 `ruling.superseded` 后变为 `superseded`；晚到或重放的旧 `ruling.recorded` 版本不新于本地，不会使状态倒退。没有 `version` 的事件（`alert`、`capabilities.changed` 等）总是应用；Capabilities 用条件 GET 刷新。
 - resync 期间到达的事件不需要客户端缓冲：重新订阅从 s0 开始，服务端会补发。
 
 ### 13.7 run 级活动流
@@ -1882,7 +1894,7 @@ R17：台账结构化。服务端自动记录：全部控制操作（谁、什�
 | 403 | `project_not_authorized` | 项目不在令牌授权清单内（R20） | 否 |
 | 404 | `not_found` | 资源不存在，或不在授权范围内（两者不区分，防止探测） | 否 |
 | 409 | `invalid_state` | 操作与当前状态不符（`details.allowed`） | 否 |
-| 409 | `version_conflict` | `If-Match`、`source_version` 或 `expected_branch_version` 不匹配；或释放时 run 分支在核验之后被移动（[§10.8](#108-释放-worktree-post-v0runsrun_idrelease-worktree)） | 重新读取后可以 |
+| 409 | `version_conflict` | `If-Match`、`source_version` 或 `expected_branch_version` 不匹配 | 重新读取后可以 |
 | 409 | `idempotency_conflict` | 同键异体 | 否 |
 | 409 | `idempotency_in_progress` | 同键请求在途 | 是（`Retry-After`） |
 | 409 | `duplicate_client_ref` | 任务 `client_ref` 已被请求体不同的任务使用（`details.existing_task_id`）；或 run `client_ref` 在任务内重复（`details.existing_run_id`、`details.same_body`）（[§2.6](#26-提交幂等p3)） | 否 |
@@ -1894,6 +1906,7 @@ R17：台账结构化。服务端自动记录：全部控制操作（谁、什�
 | 429 | `rate_limited` | 超过令牌限流 | 是（`Retry-After`） |
 | 429 | `queue_full` | 项目排队 run 数达到上限（`details.limit`） | 是 |
 | 503 | `unavailable` | 实例启动接管中，或正在维护 | 是（`Retry-After`） |
+| 501 | `not_implemented` | 阶段子集部署中尚未实现的操作、字段或取值（`details.operation`、`details.paths`、`details.available_in`，[§17.4](#174-分阶段一致性子集)） | 否 |
 | 500 | `internal` | 服务端内部错误 | 是（带退避） |
 
 **提交与 runner 额度无关**：runner 账号的限额、冻结或不健康**永远不会**让提交失败，只会让 run 停在 `held` 或 `queued`。只有「永远不可能合法」的请求才会被拒（`422`）。这是「限流」（API 层，429）与「限额」（runner 层，held）的分界。
@@ -2004,8 +2017,8 @@ R20「未授权项目不能建 run」由 `projects` 清单在每个请求上强�
 | S-13 | **P3 冲突语义** | 同键异体返回 `409 idempotency_conflict`；并发同键返回 `409 idempotency_in_progress`；任务 `client_ref` 同体（含任务已关闭之后）返回 `200` 与原任务、带 `Client-Ref-Replayed: true`，异体返回 `409 duplicate_client_ref` 并带已有任务 ID；run `client_ref` 重复返回带 `existing_run_id` 的 `409` |
 | S-14 | **P3 窗口** | 把时钟拨过 24 小时后：永久保留类操作（创建任务、追加 run、续做、消息、批量调档、裁决、台账）同键仍回放、不重复执行；状态保护类操作同键按新请求处理，结果是 `409 invalid_state`，不会再执行一次 |
 | S-15 | 校验覆盖 | §7.5 每条规则至少一个正例和一个反例 |
-| S-16 | 状态机合法性 | 用 fake runner 场景遍历 §9.2 的全部迁移（T17 已删除），事件流中的所有 `from→to` 都在表内，没有表外迁移；`PATCH` 增加未完成依赖后 queued → blocked（T20），`complete` 后 verdict 不合法 waiting → failed |
-| S-17 | 计槽与无超派 | 在全局、项目、账号上限下，任一时刻的容量预留数（含启动握手中、停止宽限期中、收尾中的 run，以及 stdin 方式的 `waiting`）都不超过上限，没有超派；预留从提交启动意图起算；resume 方式的 `waiting` 收到消息后，在取得容量之前不投递、不拉起进程 |
+| S-16 | 状态机合法性 | 用 fake runner 场景遍历 §9.2 的全部迁移（T17 已删除），事件流中的所有 `from→to` 都在表内，没有表外迁移；`PATCH` 增加未完成依赖后 queued → blocked（T20），`complete` 后 verdict 不合法 waiting → failed；依赖自然完成而目标账号仍冻结时 blocked → held（T21），不经过 queued；创建时目标账号冻结、没有合法 fallback，直接进入 held（T22） |
+| S-17 | 计槽与无超派 | 在全局、项目、账号上限下，任一时刻的容量预留数（含启动握手中、停止宽限期中、收尾中的 run，以及 stdin 方式的 `waiting`）都不超过上限，没有超派；预留从提交启动意图起算；resume 方式的 `waiting` 收到消息后，在取得容量之前不投递、不拉起进程；resume 方式的 `waiting` 经 `complete` 或停止请求收尾时不占槽 |
 | S-18 | 操作矩阵 | §9.3 每个 ✗ 返回 `409 invalid_state` 并带 `details.allowed` |
 | S-19 | 取消 | running 取消时 SIGTERM，自 `stop_sent_at` 起 `grace_s + 5` 秒后进程组被杀，转 `cancelled`，用量照记；依赖者保持 `blocked`；`cascade` 生效 |
 | S-20 | 暂停与恢复 | 暂停后有 `wip_sha`，审批打开；`continue resume` 新建 run，基点是 WIP SHA，原 run 以 `superseded` 转 `interrupted`，审批关闭；未开工的 paused run 恢复时同样新建 run |
@@ -2014,25 +2027,25 @@ R20「未授权项目不能建 run」由 `projects` 清单在每个请求上强�
 | S-23 | 守护进程重启 | `kill -9` 守护进程后 run 不死；重启后被接管，事件连续可补收（`alert recovery`） |
 | S-24 | 不静默降级 | fake runner 回报的生效模型与解析模型不同时，`model.mismatch: true`，并发 `alert model_mismatch`；runner 不回报时 `effective: null` |
 | S-25 | verdict 校验 | 缺 verdict、SHA 不符、总评不一致、JSON 不合法、证据缺少其 kind 的必填字段，都判 `deliverable_invalid`；`file` 证据用 `at: base` 引用被改动删除的路径时合法 |
-| S-26 | SHA 失效与谱系分支 | 返工产生新 SHA 后旧结论变 `superseded`，并发 `verdict.superseded`；引用旧结论的裁决返回 `422 RULING_STALE_REVIEW`；同一源 run 的两个并行返工落在不同分支，一个完成不使另一个分支上的审查失效；排队中的 integrate run 在其源 SHA 不再是候选时，开工即以 `precondition_stale` 失败 |
+| S-26 | SHA 失效与谱系分支 | 返工产生新 SHA 后旧结论变 `superseded`，并发 `verdict.superseded`；引用旧结论的裁决返回 `422 RULING_STALE_REVIEW`；同一源 run 的两个并行返工落在不同分支，一个完成不使另一个分支上的审查失效；排队中的 integrate run 在其源 SHA 不再是候选时，开工即以 `precondition_stale` 失败；裁决失效时 `ruling.superseded` 带递增的 `version`；同一下游既依赖源 run、又以固定 SHA 审查源 run 时，`continue` 整项跳过它（`sha_pinned`），各字段保持原样；被改写的下游中，由旧源 run 解析出的 `review_of.sha`、`base.sha` 被清除 |
 | S-27 | 返工上下文包 | 包中含原任务、审查结论、被审 SHA；`suggested` 按 §10.3 规则给出 |
-| S-28 | 批量调档 | dry-run 不改任何东西；实跑时跳过 critical、到底的 run，逐个校验 |
+| S-28 | 批量调档 | dry-run 不改任何东西；实跑时跳过 critical、到底的 run，逐个校验；处理完部分目标后 `kill -9` 守护进程，重启后已调整的 run 不被再调一次，剩余目标照常处理，同键重试回放完整结果 |
 | S-29 | **P2 补收** | 断开连接、期间制造 N 个事件、带 `Last-Event-ID` 重连后，收到的 `seq` 严格递增且覆盖全部 N 个 |
 | S-30 | **P2 快照衔接** | 用 `Event-Seq` 作为 `since` 订阅，不丢不重 |
 | S-31 | **P2 超出保留** | 请求的 `since` 低于 `complete_from_seq` 时收到 `stream.reset` 控制帧（没有 `id`），连接随即关闭；保留集合中还有旧的低序号事件时（比如长期活跃 run），判定仍按 `complete_from_seq`，不按 `MIN(seq)` |
 | S-32 | 错误体 | 全部错误响应都符合 §15.1，`code` 都在 §15.2 表内 |
 | S-33 | 限流 | 超速返回 429 带 `Retry-After`；限流响应头齐全 |
 | S-34 | 永不写 base | 全部用例跑完后，被管仓库中除 `mac/*` 以外的 ref 都没有变化，也没有发生 push |
-| S-35 | worktree 保留 | 受保护的 run 不被自动回收；`release-worktree` 核验祖先关系；`ref` 是本 run 分支或 `mac/*` 下的分支时被拒；核验之后移动 run 分支，删除因比较失败而中止；`discard` 需要原文确认 |
+| S-35 | worktree 保留 | 受保护的 run 不被自动回收；`release-worktree` 核验祖先关系；`ref` 是本 run 分支或 `mac/*` 下的分支时被拒；核验之后移动 run 分支、或者移动或删除保全 `ref`，引用事务整体失败，分支与目录都保留，`workspace.retention.release.state` 转为 `aborted` 并发 `run.updated`，同键重试仍回放原来的 `200`；中止后用新键可以重新释放；`discard` 需要原文确认 |
 | S-36 | L4 禁止 | `level: L4` 返回 `LEVEL_L4_FORBIDDEN`；项目配置 `max_level: L4` 不放开任何形态；每个 run 的 `policy.forbidden` 都含全部 L4 动作；持有 `decide` 的令牌也找不到任何执行合并、推送、部署或改密钥的操作 |
-| S-37 | **P3** 事务与恢复 | 在资源已提交、响应发出前注入失败，同键重试回放原结果，没有第二个资源；在写入 `in_progress` 之后、提交之前 `kill -9` 守护进程，重启后同键重试执行且只执行一次；`in_progress` 记录不因时钟拨过 24 小时而失效；确定性 4xx 被回放 |
+| S-37 | **P3** 事务与恢复 | 在资源已提交、响应发出前注入失败，同键重试回放原结果，没有第二个资源；在写入 `in_progress` 之后、提交之前 `kill -9` 守护进程，重启后同键重试执行且只执行一次；`in_progress` 记录不因时钟拨过 24 小时而失效；确定性 4xx 被回放；注入事务回滚、返回 5xx 之后，同进程内的同键重试按新请求执行且只执行一次，不返回 `409 idempotency_in_progress`；批量调档的崩溃恢复见 S-28 |
 | S-38 | 启动意图恢复 | 分别在提交启动意图之前、之后但 shim 建段目录之前、shim 已拉起端点之后 `kill -9` 守护进程：第一种 run 照常被调度；第二种经 T8 用新段号重启；第三种被重新接上，或在无法证明未启动时转 `interrupted`（`recovery_failed`）。任何情况下同一个段号都没有被启动两次 |
-| S-39 | 停止竞争与收尾 | fake runner 完成与 `cancel` 竞争时，结局由先提交者决定（§9.6 表）；完成候选之后的 `cancel` 返回 `409`；`run.finished` 之后注入尾部协议违规，run 转 `failed`（`protocol_violation`），事件流中没有终态之间的迁移 |
+| S-39 | 停止竞争与收尾 | fake runner 完成与 `cancel` 竞争时，结局由先提交者决定（§9.6 表）；完成候选之后的 `cancel` 返回 `409`；`run.finished` 之后注入尾部协议违规，run 转 `failed`（`protocol_violation`），事件流中没有终态之间的迁移；`run.finished(completed)` 之后端点不退出或留下孙进程时，宿主在退出期限后发 SIGTERM、5 秒后发 SIGKILL，进程组与 scope 最终为空，run 转 `failed`（`protocol_violation`）；`awaiting_input` 候选收尾期间的 `pause` 返回 `202`，在 run 进入 `waiting` 后生效 |
 | S-40 | 保全失败 | 注入 WIP 提交失败：run 转 `interrupted`（`preservation_failed`），不进入 `paused`；发 `alert preservation_failed`；worktree 受保护、不被自动回收；`continue` 返回 `409 preservation_failed`；`auto_continue` 不触发 |
-| S-41 | 预算执行 | 用量非流式的 fake runner，设 token 上限却没有可用的硬兜底时返回 `BUDGET_BACKSTOP_REQUIRED`；交互 run 第 2 段收到的 `limits.max_steps` 是剩余步数；预算用尽后 `continue` 返回 `BUDGET_EXHAUSTED`，resume 方式的消息不投递 |
+| S-41 | 预算执行 | 用量非流式的 fake runner，设 token 上限却没有可用的硬兜底时返回 `BUDGET_BACKSTOP_REQUIRED`；交互 run 第 2 段收到的 `limits.max_steps` 是剩余步数；预算用尽后 `continue` 返回 `BUDGET_EXHAUSTED`，resume 方式的消息不投递并被作废；非流式 fake runner 在 `run.finished(completed)` 的最终回执中才首次超限时，run 转 `paused`（`budget_exceeded`）而不是 `done`；任务预算超限时追加 run 返回 `BUDGET_EXHAUSTED`，任务中的终态 run 不受影响 |
 | S-42 | 日志消费原子性 | 在消费 runner 日志的过程中 `kill -9` 守护进程，重启后用量、上游事件都没有重复或缺失；清理事件并重启后，新事件的 `seq` 大于清理前的最大值 |
 
-**判定**：S-01 至 S-42 全部通过，才算「完整一致」。各阶段部署为稳定实例的门槛是对应的分阶段子集（[§17.4](#174-分阶段一致性子集)），不要求在 Phase 1 就通过全部用例。套件产出 `supervisor-conformance-report.json`，格式与 Runner Protocol §16.5 相同（`suite: "mac.supervisor"`），并在 `profiles` 中标明所测的阶段子集。
+**判定**：S-01 至 S-42 全部通过，才算「完整一致」。各阶段部署为稳定实例的门槛是对应的分阶段子集（[§17.4](#174-分阶段一致性子集)），不要求在 Phase 1 就通过全部用例。套件产出 `supervisor-conformance-report.json`，格式与 Runner Protocol §16.5 相同（`suite: "mac.supervisor"`），并在 `profiles` 中标明所测的阶段子集。服务端报告没有能力集合：`capability_classes` 为 `[]`，`profiles`、`cases` 中的 `features_sha256` 为 `null`。
 
 ### 17.2 客户端合规清单
 
@@ -2061,12 +2074,22 @@ R20「未授权项目不能建 run」由 `projects` 清单在每个请求上强�
 
 计划 §6 规定 Phase 1 验收要求「服务端通过 Phase 1 范围的 S 一致性用例」。各阶段的部署门槛是**本阶段及之前各阶段**的子集全部通过；S-01 至 S-42 全部通过只在 Phase 4 之后要求。runner 侧的分阶段子集见 Runner Protocol §16.8。
 
-| 阶段 | 本阶段加入的 S 用例 | 对应的计划内容 |
-|---|---|---|
-| Phase 1 | S-01–S-05；S-06（`capabilities.changed` 经 JSON 补收页检查）；S-07–S-14；S-15 中除审查与集成类规则（`REVIEW_*`、`INTEGRATE_*`）以外的规则；S-16 中除依赖账号冻结的迁移（T6、T7、T21）以外的迁移；S-18–S-20；S-22–S-24；S-32–S-40；S-42 | 状态机与事件落盘、shim 托管、恢复接管、fake runner、令牌认证与最小授权、role 与 model/effort 字段、capabilities 档位目录、WIP 保全 |
-| Phase 2 | S-16 剩余迁移；S-17；S-21 | 双层信号量、账号级配额、限额 WIP 保全与接替 |
-| Phase 3 | S-28；S-41 | 预算护栏（R13）、批量调档 |
-| Phase 4 | S-15 剩余规则；S-25–S-27；S-29–S-31 | 审查链与 verdict 校验（R14–R16）、SSE（R18） |
+子集按用例的**子场景**划分：同一个用例的不同子场景可以属于不同阶段，表中写作「S-nn（子场景）」；没有注明子场景的用例整体属于该阶段。子场景用到的操作或字段在哪个阶段实现，子场景就属于哪个阶段。
+
+| 阶段 | 本阶段加入的 S 用例与子场景 | 本阶段起实现的操作与字段（此前各阶段按下文拒绝） | 对应的计划内容 |
+|---|---|---|---|
+| Phase 1 | S-01–S-05；S-06（`capabilities.changed` 经 JSON 补收页检查）；S-07、S-08；S-09（主目标的降级授权、硬只读拒绝）；S-10–S-13；S-14（创建任务、追加 run、续做、消息，以及状态保护类操作）；S-15（`SCHEMA_INVALID`、`RUNNER_UNKNOWN`、`ACCOUNT_UNKNOWN`、`MODEL_UNAVAILABLE`、`TIER_UNRESOLVABLE`、`EFFORT_UNSUPPORTED`、`CAP_READ_ONLY_UNENFORCEABLE`、`CAP_INTERACTION_UNSUPPORTED`、`read_only` 的 `DEGRADE_INVALID`、`DEGRADE_FORBIDDEN_BY_POLICY`、`RUNNER_REJECTED`、`LEVEL_*`、`FORBIDDEN_UNENFORCEABLE`）；S-16（下面三行列出的迁移与触发之外的全部迁移，包括正常完成、交互轮次、主管操作、超时、runner 崩溃、宿主重启与启动恢复、保全失败）；S-18；S-19（不含 `cascade` 与依赖者）；S-20；S-22–S-24；S-32–S-40；S-42 | 下面三行没有列出的全部操作与字段 | 状态机与事件落盘、shim 托管、恢复接管、fake runner、令牌认证与最小授权、role 与 model/effort 字段、capabilities 档位目录、WIP 保全 |
+| Phase 2 | S-09（fallback 上的降级授权在改派时才生效）；S-15（`REF_UNKNOWN`、`DEP_CYCLE`、`DEP_CROSS_PROJECT`、`FALLBACK_INVALID`、`REHOME_INVALID`）；S-16（依赖与目标可用性触发的迁移 T2、T3、T6、T7、T20–T22，以及撞限等环境类错误、内存护栏触发的迁移）；S-17；S-19（`cascade`，依赖者保持 `blocked`）；S-21 | `depends_on`、`priority`、`base.kind: run`、`fallbacks`（含各自的 `degrade`）、`on_interrupt: auto_continue`、`cancel` 的 `cascade` | 双层信号量、优先级与依赖、账号级配额、内存护栏、限额 WIP 保全与接替 |
+| Phase 3 | S-14（批量调档）；S-15（`CAP_MAX_STEPS_UNSUPPORTED`、`max_steps` 的 `DEGRADE_INVALID`、`BUDGET_BACKSTOP_REQUIRED`、`BUDGET_EXHAUSTED`）；S-16（预算、步数触发的迁移）；S-28；S-41 | 任务与 run 的 `budget`（含 `max_steps`，以及 `PATCH` 中的 `budget`）、`degrade` 中的 `max_steps`、`POST /v0/runs/batch-adjust` | 预算护栏（R13）、批量调档 |
+| Phase 4 | S-14（裁决、台账）；S-15（`REVIEW_*`、`INTEGRATE_*`、`WAIVER_INVALID`）；S-16（交付物校验触发的迁移，含 `complete` 后 verdict 不合法的 waiting → failed）；S-25–S-27；S-29–S-31 | `role` 取 `review`、`audit`、`integrate`，以及 `review_of`、`target_branch`、`integrate_sources`、`waivers`；`continue` 的 `verdicts`、`ruling_id`；`close` 的 `outcome: accepted`；审查结论、裁决与台账端点（O-26–O-30）；SSE（O-32 与 O-24 的 SSE 形式） | 审查链与 verdict 校验（R14–R16）、台账与导出（R17）、SSE（R18） |
+
+**阶段之外的操作与字段**：实例部署为某一阶段的稳定实例时，表中属于后续阶段的操作与字段可以尚未实现，但必须确定性地拒绝，不得接受后忽略，也不得按缺省值执行（[§2.4](#24-前向兼容must-ignore)、[§3.3](#33-请求协商)）：
+
+- 未实现的端点，或端点未实现的形式（比如 Phase 4 之前的 SSE），返回 `501 not_implemented`，`details.operation` 指明操作，`details.available_in` 指明实现它的阶段；
+- 已实现端点的请求中出现未实现的字段（取值不等于缺省值）或取值时，整个请求返回 `501 not_implemented`，`details.paths` 列出这些位置，不创建任何资源；
+- `501` 在执行之前判定，不写入幂等记录（[§2.6](#26-提交幂等p3)），实现之后同键重试按新请求执行。
+
+每个阶段的子集还包括：对表中后续阶段的每一项操作与字段，至少验证一次上述拒绝行为。
 
 Phase 1 实现事件落盘与 JSON 补收页，SSE 在 Phase 4 实现；Phase 1 的事件连续性由 S-23、S-42 经 JSON 补收页检查。
 
@@ -2079,7 +2102,7 @@ Phase 1 实现事件落盘与 JSON 补收页，SSE 在 Phase 4 实现；Phase 1 
 | SD-01 | 项目条目 v0 只读，写操作走实例配置 | §1.1、§6.4 |
 | SD-02 | 线上字段一律 snake_case（`depends_on`、`read_only`） | §2.2 |
 | SD-03 | 未知值编码为 `null`，禁止用 0 或请求值冒充 | §2.2 |
-| SD-04 | **P3** 两层幂等：`Idempotency-Key`（按实际路径的作用域、含路径与协议版本的 JCS 指纹、与资源变更同事务的记录、崩溃恢复、24 小时窗口与永久保留类、同体回放、异体或在途冲突）+ 覆盖全部状态的 `client_ref`（同体定位、异体冲突）（v0.2 修订） | §2.6 |
+| SD-04 | **P3** 两层幂等：`Idempotency-Key`（按实际路径的作用域、含路径与协议版本的 JCS 指纹、与资源变更同事务的记录、崩溃恢复与回滚后清除在途记录、批量调档的批次计划与逐项进度、24 小时窗口与永久保留类、同体回放、异体或在途冲突）+ 覆盖全部状态的 `client_ref`（同体定位、异体冲突）（v0.2 修订，补丁轮修订） | §2.6、§10.7 |
 | SD-05 | 版本 `MAJOR.MINOR`：MAJOR 进路径，MINOR 经请求头协商；读请求取 min，写请求不降级、不支持即拒；请求严格、响应 must-ignore；同 MAJOR 只做加法；0.x 在 Phase 1 验收前可勘误，0.2 取代未实现的 0.1（v0.2 修订） | §2.4、§3 |
 | SD-06 | 档位别名 `@low/@mid/@high`；强度阶梯 `minimal…max`；不支持的强度直接拒绝，不就近替换；模型与强度记「请求/解析/生效」三段 | §6.5、§8.2 |
 | SD-07 | 任务与一批 run 原子提交，用局部 `ref` 构成 DAG；`base.kind=run` 与 `review_of` 隐含依赖 | §7.1、§7.2 |
@@ -2090,15 +2113,15 @@ Phase 1 实现事件落盘与 JSON 补收页，SSE 在 Phase 4 实现；Phase 1 
 | SD-12 | **P1** 能力缺口只有「拒绝」与「逐项授权降级」两种处理；按目标账号的有效能力判定；降级按 placement 分别授权、在选定目标时确定生效项；硬只读不可降级；可降级能力及降级方式固定（`read_only→advisory`、`max_steps→duration_cap`）；`degrade` 与 `waivers` 分开（v0.2 修订） | §6.2、§7.4 |
 | SD-13 | 不在计划的 11 个状态之外加状态；停止中的阶段用 `stop_request` 表达 | §9.1 |
 | SD-14 | 启动未产生工作（环境失败且无工作，或恢复时证明启动意图未执行）不终结 run，回到调度；重试至多 3 次、启动尝试共 4 次，每次用新段号（v0.2 修订） | §9.2 T8 |
-| SD-15 | 内存护栏归 `paused`，各类超时归 `interrupted`（**待确认**） | §9.2 |
-| SD-16 | 正常结束时自动做最终提交，保证产出总是「分支 + SHA」；保全范围为已跟踪改动与未被忽略的未跟踪文件；worktree 目录与 run 分支分开回收，保全未完成不删目录；run 分支永不自动删除；释放时保全 ref 必须在删除集合之外，删除用比较后删除；`in_place` 拒绝脏仓库根（v0.2 修订） | §9.5、§10.8 |
-| SD-17 | `continue` 一个入口承接 resume、takeover、rework，暂停恢复一律新建 run；续做、源 run 终结与下游改写在一个事务中；批量调档逐个生效、非原子（v0.2 修订） | §10.3、§10.7 |
+| SD-15 | 内存护栏归 `paused`，各类超时归 `interrupted`（主管已裁决采纳：v0.1 设计单裁决第 3 条） | §9.2 |
+| SD-16 | 正常结束时自动做最终提交，保证产出总是「分支 + SHA」；保全范围为已跟踪改动与未被忽略的未跟踪文件；worktree 目录与 run 分支分开回收，保全未完成不删目录；run 分支永不自动删除；释放时保全 ref 必须在删除集合之外，删除时在同一个 Git 引用事务中核对保全 ref 未变并比较后删除 run 分支，释放结果以持久的释放状态表达；`in_place` 拒绝脏仓库根（v0.2 修订，补丁轮修订） | §9.5、§10.8 |
+| SD-17 | `continue` 一个入口承接 resume、takeover、rework，暂停恢复一律新建 run；续做、源 run 终结与下游改写在一个事务中，固定 SHA 的下游整项跳过；批量调档逐个生效、非原子，以持久的固定目标集合与逐项进度保证崩溃后不重复调整（v0.2 修订，补丁轮修订） | §10.3、§10.7 |
 | SD-18 | 审查结论有效性按「被审 run 所在谱系分支的当前候选 SHA」判定；分叉开出新分支，候选按分支以 CAS 推进；裁决、验收、集成开工都绑定 SHA 与分支版本；旧结论与旧裁决自动失效并发事件（v0.2 修订） | §11.3、§11.4 |
 | SD-19 | 审批是派生的收件箱，通过对 run 执行操作来关闭，不设单独的「批准」端点 | §12 |
 | SD-20 | **P2** 全局 `seq` 偏移在同一事务中分配，高水位永不复用；`Last-Event-ID`/`since` 补收；只按连续前缀清理，保留不少于 14 天，以 `complete_from_seq` 判定可补收；超出时发 `stream.reset` 控制帧并断开；多快照按最小 `Event-Seq` 订阅、逐资源版本合并（v0.2 修订） | §2.8、§13.3、§13.6 |
 | SD-21 | 执行形态（L1–L3）与动作风险（L4）分开；L4 动作（写共享 ref、push、部署、改密钥）需人工批准，这是不可放宽的硬约束，0.2 中不可执行；私有 run 分支内的集成属 L3；矩阵规范性，项目只能收紧 | §7.3 |
-| SD-22 | 预算分任务、run、段三层，段共享 run 的剩余额度；步是一次模型调用；非流式或未知用量必须有实际生效的硬兜底；各时钟的起点、暂停与跨段规则固定；预算仍超限不得恢复执行 | §7.8 |
-| SD-23 | 停止请求以提交时刻为线性化点，与结局候选先到先得，`cancel` 可取代其他停止；终态在输出读完、进程组退出、保全与校验结束后一次提交；宽限期从实际发出信号起算；保全失败显式可见、禁止回收与静默恢复 | §9.6 |
+| SD-22 | 预算分任务、run、段三层，段共享 run 的剩余额度；步是一次模型调用；非流式或未知用量必须有实际生效的硬兜底；各时钟的起点、暂停与跨段规则固定；预算核算先于结局候选；预算仍超限不得恢复执行（补丁轮修订） | §7.8 |
+| SD-23 | 停止请求以提交时刻为线性化点，与结局候选先到先得，`cancel` 可取代其他停止；终态在输出读完、进程组退出、保全与校验结束后一次提交；宽限期从实际发出信号起算；结局锁定不妨碍物理清退，候选之后到期未退出的端点被强制清退并判协议违规；收尾只保留已有容量；保全失败显式可见、禁止回收与静默恢复（补丁轮修订） | §9.6 |
 
 ## 附录 A：端到端示例
 
@@ -2166,3 +2189,4 @@ Phase 1 实现事件落盘与 JSON 补收页，SSE 在 Phase 4 实现；Phase 1 
 |---|---|---|
 | 0.1-draft | 2026-11-27 | 首版草案（Phase 1 首批交付），落实计划 v1.2 R25 与主管四项协议原则 |
 | 0.2-draft | 2026-11-27 | 交叉审查返工修订：关闭必修 M01–M22（逐条记录见 [spec-revision-log.md](spec-revision-log.md)）。线上协议版本升为 `0.2`，与未实现的 0.1 草案不兼容；`mac.verdict` schema 升为 `0.2`。SD-11 作废，新增 SD-21–SD-23，修订 SD-04、05、08、10、12、14、16、17、18、20 |
+| 0.2-draft（补丁轮） | 2026-11-27 | 修补 delta 复审缺陷 D1–D8（逐条记录见 [spec-revision-log.md](spec-revision-log.md) §7）：批量调档的批次计划与逐项进度、回滚后清除在途记录（§2.6、§10.7）；Ruling 带 `version`、按版本合并（§2.8、§4.2、§11.4、§13.4、§13.6）；归位迁移扩展到依赖与目标状态变化，新增 T22（§9.2）；逻辑结局与物理清退分开、收尾只保留已有容量、`awaiting_input` 收尾期间的停止请求排队（§9.3、§9.6）；预算核算先于结局候选、超限消息一律作废、任务超限只作用于非终态 run（§7.5、§7.8、§9.6）；阶段子集按子场景划分、未实现部分以 `501 not_implemented` 拒绝（§15.2、§17.4）；释放 worktree 在一个 Git 引用事务中核对保全 ref、持久释放状态（§8.1、§10.8）；固定 SHA 的下游整项跳过、清除旧解析结果（§10.3）。SD-15、§6.5、§7.1 的待确认标记改为主管裁决出处。**线上协议版本仍为 `0.2`**：0.2 尚未实现，本轮按草案期原位勘误处理（§3.1）；`mac.*` schema 编号也不变。修订 SD-04、16、17、22、23 |
