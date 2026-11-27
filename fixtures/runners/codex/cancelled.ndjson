@@ -1,0 +1,9 @@
+{"type":"lifecycle","message":"run started — workflow \"quick-task\" (runner: codex)","seq":1,"ts":"2026-11-26T07:19:22.746Z"}
+{"type":"note","message":"[REDACTED:TEXT]","seq":2,"ts":"2026-11-26T07:19:22.755Z"}
+{"type":"note","message":"[REDACTED:TEXT]","seq":3,"ts":"2026-11-26T07:19:22.808Z"}
+{"type":"step-start","stepId":"task","name":"[REDACTED:TEXT]","kind":"agent","iteration":1,"seq":4,"ts":"2026-11-26T07:19:22.882Z"}
+{"type":"session","sessionId":"01a216b9-294a-7771-8ab8-49a70763efcb","stepId":"task","seq":5,"ts":"2026-11-26T07:19:23.316Z"}
+{"type":"session.started","sessionId":"01a216b9-294a-7771-8ab8-49a70763efcb","backend":"codex","stepId":"task","seq":6,"ts":"2026-11-26T07:19:23.316Z"}
+{"type":"turn.started","turnId":"01a216b9-29b7-72d1-91c3-233ef393d06d","stepId":"task","seq":7,"ts":"2026-11-26T07:19:23.620Z"}
+{"type":"lifecycle","message":"run cancelled","seq":8,"ts":"2026-11-26T07:30:29.998Z"}
+{"type":"session.ended","reason":"cancelled","stepId":"task","seq":9,"ts":"2026-11-26T07:30:31.614Z"}
