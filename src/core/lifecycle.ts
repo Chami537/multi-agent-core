@@ -17,7 +17,8 @@ export function move(run: Run, to: State, reason: string | null, transition?: st
 }
 export function requestStop(run: Run, kind: StopKind, now: number, preserveWip = false, reason: string | null = null): 'accepted' | 'queued' {
   if (['done', 'failed', 'cancelled', 'interrupted'].includes(run.state)) throw new InvalidState('terminal');
-  if (!run.stop && run.finalizing && run.candidate?.data.outcome !== 'awaiting_input') throw new InvalidState('finalizing');
+  if (kind === 'pause' && run.state === 'paused') throw new InvalidState('paused');
+  if (!run.stop && run.finalizing && run.candidate && run.candidate.data.outcome !== 'awaiting_input') throw new InvalidState('finalizing');
   // Paused/queued receipts describe a previous segment, never an active finalizer.
   if (!run.finalizing && !['running', 'waiting'].includes(run.state)) { run.candidate = null; run.stop = null; }
   if (!run.stop || (kind === 'cancel' && run.stop.kind !== 'cancel')) {

@@ -61,7 +61,9 @@ export function ingest(store: Store, runId: string, path: string, now = Date.now
           }
           count++;
         } else {
-          if (!('id' in frame) || frame.error || (c.finishedOffset !== null && offset > c.finishedOffset)) throw new ProtocolError('unexpected_rpc_frame');
+          // The shim's initial capabilities request is id 2; refusal keeps SIGTERM fallback.
+          const capabilitiesError = frame.id === 2 && c.lastSeq === 0;
+          if (!('id' in frame) || (frame.error && !capabilitiesError) || (c.finishedOffset !== null && offset > c.finishedOffset)) throw new ProtocolError('unexpected_rpc_frame');
           if (typeof frame.id === 'string' && frame.result?.accepted) {
             const command = store.db.prepare('SELECT params,method FROM commands WHERE run_id=? AND segment=? AND command_id=?').get(run.id,run.segment,frame.id);
             if (command) {

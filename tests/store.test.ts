@@ -74,6 +74,17 @@ describe('SQLite event transaction and NDJSON recovery',()=>{
     if(kind==='non_json')text+='bad JSON\n';
     writeFileSync(path,text);ingest(store,r.id,path);expect(store.get(r.id).protocolViolation).toBeTruthy();
   });
+  it.each([
+    [2,'before',false], [1,'before',true], [3,'before',true], [2,'started',true], [2,'finished',true],
+  ] as const)('N2: RPC error id=%s at %s has protocol violation=%s', (id,phase,violation)=>{
+    const {store,r,path}=fixture();
+    const reply=JSON.stringify({jsonrpc:'2.0',id,error:{code:-32003,message:'wrong session'}})+'\n';
+    const end=frame(2,'run.finished',finished());
+    const text=phase==='before'?reply+start()+end:start()+(phase==='finished'?end:'')+reply;
+    writeFileSync(path,text);ingest(store,r.id,path);
+    expect(!!store.get(r.id).protocolViolation).toBe(violation);
+    if(!violation)expect(store.get(r.id).candidate?.data.outcome).toBe('completed');
+  });
   it('repairs a partial tail only after writer lock is free AND producer/group are gone',()=>{
     const {dir,path}=fixture(); const text=start(); writeFileSync(path,text+'partial秘密');
     const producer={shim:{pid:999_999_999,start:'0',boot:bootId()},pgid:null,boot:bootId()};

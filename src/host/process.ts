@@ -38,10 +38,7 @@ export function ownsGroup(group: GroupIdentity | null): boolean {
   if (!group || group.leader.boot !== bootId()) return false;
   const leader = processInfo(group.leader.pid);
   if (leader && (leader.start !== group.leader.start || leader.group !== group.leader.pid || leader.session !== group.leader.pid)) return false;
-  return [group.leader, ...group.members].some(who => {
-    const p = processInfo(who.pid);
-    return alive(who) && p?.group === group.leader.pid && p.session === group.leader.pid;
-  });
+  return groupMembers(group.leader).length > 0;
 }
 export function signalGroup(group: GroupIdentity, signal: NodeJS.Signals): boolean {
   const pgid = group.leader.pid;

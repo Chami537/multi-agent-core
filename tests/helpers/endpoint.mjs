@@ -1,6 +1,7 @@
 import { createInterface } from 'node:readline';
 import { spawn } from 'node:child_process';
 import { createWriteStream, writeFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 const mode=process.argv[2];
 let seq=0;
 const send=x=>process.stdout.write(JSON.stringify(x)+'\n');
@@ -11,7 +12,11 @@ const finish=(outcome='completed')=>emit('run.finished',{outcome,error:null,work
 createInterface({input:process.stdin}).on('line',line=>{
  const req=JSON.parse(line);
  if(req.method==='initialize')send({jsonrpc:'2.0',id:req.id,result:{protocol_version:'0.2'}});
- if(req.method==='capabilities')send({jsonrpc:'2.0',id:req.id,result:{features:{cancel:{control_message:mode.startsWith('control'),grace_s:1}}}});
+ if(req.method==='capabilities'){
+   if(mode==='capabilities-error')send({jsonrpc:'2.0',id:req.id,error:{code:-32003,message:'capabilities requires a control session'}});
+   else send({jsonrpc:'2.0',id:req.id,result:{features:{cancel:{control_message:mode.startsWith('control'),grace_s:1}}}});
+ }
+ if(req.method==='run.complete'&&mode==='complete-hang')send({jsonrpc:'2.0',id:req.id,result:{accepted:true}});
  if(req.method==='run.cancel'&&mode.startsWith('control')){
    writeFileSync('cancel.json',JSON.stringify({params:req.params,at:Date.now()}));send({jsonrpc:'2.0',id:req.id,result:{accepted:true}});if(mode==='control')finish('cancelled');
  }
@@ -21,6 +26,12 @@ createInterface({input:process.stdin}).on('line',line=>{
      spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setTimeout(()=>{},30000)"],{stdio:'ignore',env:{}});
    }
    if(mode==='crash-orphan'){setTimeout(()=>process.exit(2),40);return;}
+   if(mode==='late-orphan'){
+     spawn(process.execPath,[fileURLToPath(new URL('./late-descendant.mjs',import.meta.url))],{stdio:'ignore',env:{}});
+     finish();setTimeout(()=>process.exit(0),20);return;
+   }
+   if(mode==='complete-hang'){emit('input.requested',{prompt:'next'});return;}
+   if(mode==='capabilities-error')return;
    if(mode.startsWith('control')||mode==='no-control')return;
    if(mode==='stderr-large'||mode==='raw-large'){
      const stream=mode==='stderr-large'?process.stderr:createWriteStream(null,{fd:3,autoClose:false});
@@ -32,5 +43,8 @@ createInterface({input:process.stdin}).on('line',line=>{
    if(mode==='trailing'){emit('message',{text:'illegal trailing message'});}
  }
 }).on('close',()=>{if(mode!=='linger'&&mode!=='trailing')process.exit(0);});
-process.on('SIGTERM',()=>{if(mode==='control')writeFileSync('term.json','unexpected');});
+process.on('SIGTERM',()=>{
+  if(mode==='control')writeFileSync('term.json','unexpected');
+  if(mode==='capabilities-error')writeFileSync('term.json','received');
+});
 setTimeout(()=>process.exit(started?0:1),30000);
