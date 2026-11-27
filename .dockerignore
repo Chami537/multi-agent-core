@@ -1,0 +1,6 @@
+.git
+.ai
+node_modules
+dist
+coverage
+*.sqlite*

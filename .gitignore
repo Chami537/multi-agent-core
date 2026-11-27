@@ -3,3 +3,8 @@ node_modules/
 dist/
 .env
 *.log
+coverage/
+*.tsbuildinfo
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
