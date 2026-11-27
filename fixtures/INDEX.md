@@ -206,3 +206,5 @@ git diff --check
 handoff、task report 或配置的命令。没有 push/merge。
 
 > 公开脱敏注记（2026-11-27）：转公开前，本机推理网关的回环端口已统一替换为 `<gateway-port>`（涉及 check.py 的 SAFE_ERRORS、runners/claude/retry-502.ndjson 共 5 处、及设计计划 R11）；manifest 中 retry-502 的 fixture_sha256 已同步更新为脱敏后哈希，源记录哈希不变，`--sources` 对该样本的比对差异为预期行为。
+
+> 证据等级标注（2026-11-27，M17 补标）：本目录全部 10 份样本的证据等级为 `historical_projection`（Cezar 持久化投影与抽样片段），已在 manifest.json 逐样本以 `evidence_grade` 字段机器可读标注。它们支持「真实历史中发生过什么」的结论，不支持原生 wire 格式、逐行 flush 与原生退出码的结论；原生录制与合成故障样本为后续独立类别，接入一致性套件时分开标记。
