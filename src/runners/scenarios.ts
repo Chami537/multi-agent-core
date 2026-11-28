@@ -1,10 +1,10 @@
 export type Operation = { op: string; [key: string]: unknown };
-export interface Scenario { schema: 'mac.fake-scenario/0.2'; model_effective?: string | null; effort_effective?: string | null; steps: Operation[] }
+export interface Scenario { schema: 'mac.fake-scenario/0.2'; model_effective?: string | null; effort_effective?: string | null; native_session_id?: string | null; steps: Operation[] }
 export function scenario(value: unknown): Scenario {
   if (typeof value === 'object' && value !== null) {
     const s = value as Scenario;
     if (s.schema !== 'mac.fake-scenario/0.2' || !Array.isArray(s.steps) || s.steps.some(o => !o || typeof o.op !== 'string')) throw new Error('invalid_scenario');
-    const supported = new Set(['step','message','reasoning','tool','usage','sleep','await_input','fail','complete','ignore_sigterm','spawn_child','crash','emit_raw','hang']);
+    const supported = new Set(['step','message','reasoning','tool','usage','sleep','await_input','fail','complete','ignore_sigterm','spawn_child','crash','native_crash','model_changed','emit_raw','hang']);
     for (const op of s.steps) if (!supported.has(op.op)) throw new Error(`not_implemented: scenario.${op.op}`);
     return s;
   }

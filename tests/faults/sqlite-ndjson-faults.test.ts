@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -20,10 +20,18 @@ function makeTempRoot(prefix: string): string {
   return root;
 }
 
-async function killAndWait(pid: number): Promise<void> {
-  const id = identity(pid);
+async function killAndWait(child: ChildProcess): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(res => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      res({ code: child.exitCode, signal: child.signalCode });
+    } else {
+      child.once('exit', (code, signal) => res({ code, signal }));
+    }
+  });
+  const id = identity(child.pid!);
   signalProcess(id, 'SIGKILL');
   await until(() => !alive(id), 5_000);
+  return exitPromise;
 }
 
 afterEach(async () => {
@@ -43,12 +51,15 @@ describe('SQLite & NDJSON SIGKILL fault injection', () => {
     const readyPath = join(root, 'ready.json');
 
     const child = spawn(process.execPath, [workerPath, 'wal_write_mid_tx', dbPath, readyPath, ws], { stdio: 'ignore' });
+    let exit: { code: number | null; signal: NodeJS.Signals | null };
     try {
       await until(() => existsSync(readyPath), 5_000);
-      await killAndWait(child.pid!);
+      exit = await killAndWait(child);
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     }
+    expect(exit.signal).toBe('SIGKILL');
+    expect(exit.code).toBeNull();
 
     const store = new Store(dbPath);
     try {
@@ -85,13 +96,16 @@ describe('SQLite & NDJSON SIGKILL fault injection', () => {
 
     const child = spawn(process.execPath, [workerPath, 'ndjson_append_mid_line', segDir, readyPath], { stdio: 'ignore' });
     let info: { shim: Producer['shim']; pgid: number | null; boot: string; completeBytes: number };
+    let exit: { code: number | null; signal: NodeJS.Signals | null };
     try {
       await until(() => existsSync(readyPath), 5_000);
       info = jsonFile<typeof info>(readyPath)!;
-      await killAndWait(child.pid!);
+      exit = await killAndWait(child);
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     }
+    expect(exit.signal).toBe('SIGKILL');
+    expect(exit.code).toBeNull();
 
     const repaired = repairTail(segDir, { shim: info.shim, pgid: info.pgid, boot: info.boot });
     expect(repaired).not.toBeNull();
@@ -137,7 +151,7 @@ describe('SQLite & NDJSON SIGKILL fault injection', () => {
     expect(rt.store.get(r.id).candidate?.data.outcome).toBe('completed');
   });
 
-  it('SIGKILL while advancing event seq leaves contiguous seqs without gaps or duplicates', async () => {
+  it('SIGKILL while advancing event seq rolls back uncommitted seq, keeps cursor/consumed/usage/events consistent, and diagnoses gaps', async () => {
     const rt = makeRuntime();
     const r = rt.create({ workspace: workspace(rt) });
     r.segment = 1;
@@ -154,12 +168,15 @@ describe('SQLite & NDJSON SIGKILL fault injection', () => {
     rt.close();
 
     const child = spawn(process.execPath, [workerPath, 'event_seq_advancing', dbPath, r.id, ndjsonPath, readyPath], { stdio: 'ignore' });
+    let exit: { code: number | null; signal: NodeJS.Signals | null };
     try {
       await until(() => existsSync(readyPath), 5_000);
-      await killAndWait(child.pid!);
+      exit = await killAndWait(child);
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     }
+    expect(exit.signal).toBe('SIGKILL');
+    expect(exit.code).toBeNull();
 
     const reopened = new Store(dbPath);
     try {
@@ -168,19 +185,41 @@ describe('SQLite & NDJSON SIGKILL fault injection', () => {
 
       const events = reopened.eventsSince(0, 1000).events;
       expect(events.map(e => e.seq)).toEqual(Array.from({ length: highBefore }, (_, i) => i + 1));
+      expect(events.every(e => !('uncommitted' in e.data))).toBe(true);
 
       const c = cursor(reopened, r.id, 1);
+      expect(c.lastSeq).toBe(10);
       const consumedCount = Number(reopened.db.prepare('SELECT COUNT(*) n FROM consumed WHERE run_id=? AND segment=1').get(r.id)?.n);
-      expect(consumedCount).toBe(c.lastSeq);
+      expect(consumedCount).toBe(10);
+      expect(reopened.get(r.id).usage).toMatchObject({ input_tokens: 100, steps: 9 });
 
-      // Re-ingesting the NDJSON file must not duplicate already-consumed events
+      // Re-ingesting the NDJSON file consumes seq 11 cleanly without duplicating 1..10
       const reingested = ingest(reopened, r.id, ndjsonPath);
+      expect(reingested).toBe(1);
       const highAfter = reopened.meta().high;
+      expect(highAfter).toBeGreaterThan(highBefore);
+      expect(cursor(reopened, r.id, 1).lastSeq).toBe(11);
+      expect(Number(reopened.db.prepare('SELECT COUNT(*) n FROM consumed WHERE run_id=? AND segment=1').get(r.id)?.n)).toBe(11);
+      expect(reopened.get(r.id).usage).toMatchObject({ input_tokens: 110, steps: 10 });
       const allEvents = reopened.eventsSince(0, 1000).events;
       expect(allEvents.map(e => e.seq)).toEqual(Array.from({ length: highAfter }, (_, i) => i + 1));
-      if (reingested === 0) {
-        expect(highAfter).toBe(highBefore);
-      }
+
+      // Sequence gap on NDJSON must mark protocolViolation and record a diagnostic
+      appendFileSync(
+        ndjsonPath,
+        JSON.stringify({
+          jsonrpc: '2.0',
+          method: 'event',
+          params: { seq: 13, ts: new Date(0).toISOString(), type: 'usage', data: { ...emptyUsage(), input_tokens: 130, steps: 12 } },
+        }) + '\n',
+      );
+      expect(ingest(reopened, r.id, ndjsonPath)).toBe(0);
+      expect(reopened.get(r.id).protocolViolation).toContain('sequence_gap_or_invalid_first_event');
+      const diag = reopened.db
+        .prepare("SELECT kind, payload FROM diagnostics WHERE run_id=? AND kind='protocol_violation' ORDER BY id DESC LIMIT 1")
+        .get(r.id) as { kind: string; payload: string } | undefined;
+      expect(diag?.kind).toBe('protocol_violation');
+      expect(JSON.parse(diag!.payload).error).toContain('sequence_gap_or_invalid_first_event');
     } finally {
       reopened.close();
     }
@@ -193,14 +232,15 @@ describe('SQLite & NDJSON SIGKILL fault injection', () => {
 
     const daemon = spawn(process.execPath, [workerPath, 'daemon_live_run', root, ws], { stdio: 'ignore' });
     let info: { runId: string; shim: { pid: number; start: string; boot: string }; endpoint: { pid: number; start: string; boot: string } };
+    let exit: { code: number | null; signal: NodeJS.Signals | null };
     try {
       await until(() => existsSync(join(root, 'ready.json')), 5_000);
       info = jsonFile<typeof info>(join(root, 'ready.json'))!;
-      await killAndWait(daemon.pid!);
+      exit = await killAndWait(daemon);
     } finally {
       if (daemon.exitCode === null && daemon.signalCode === null) daemon.kill('SIGKILL');
     }
-
+    expect(exit.signal).toBe('SIGKILL');
     expect(alive(info.shim)).toBe(true);
     expect(alive(info.endpoint)).toBe(true);
 
@@ -211,6 +251,71 @@ describe('SQLite & NDJSON SIGKILL fault injection', () => {
     expect(recovered.epoch).toBeGreaterThan(1);
     expect(recovered.store.get(info.runId).state).toBe('running');
     expect(recovered.host.facts(recovered.store.get(info.runId).runDir, 1).endpointAlive).toBe(true);
+
+    recovered.stop(info.runId);
+    const cancelled = await state(recovered, info.runId, 'cancelled');
+    expect(cancelled.reason).toBe('supervisor_cancel');
+    expect(recovered.host.facts(cancelled.runDir, 1).groupAlive).toBe(false);
+
+    const events = recovered.store.eventsSince(0, 1000).events;
+    expect(events.map(e => e.seq)).toEqual(Array.from({ length: recovered.store.meta().high }, (_, i) => i + 1));
+  });
+
+  it('SIGKILL during takeover persistence/fencing window prevents duplicate launch, duplicate consumption, and preserves control', async () => {
+    const root = makeTempRoot('mac-fault-takeover-');
+    const ws = join(root, 'workspace');
+    mkdirSync(ws, { recursive: true });
+
+    // Daemon 1 launches a live run and is SIGKILLed.
+    const daemon1 = spawn(process.execPath, [workerPath, 'daemon_live_run', root, ws], { stdio: 'ignore' });
+    let info: { runId: string; shim: { pid: number; start: string; boot: string }; endpoint: { pid: number; start: string; boot: string } };
+    let exit1: { code: number | null; signal: NodeJS.Signals | null };
+    try {
+      await until(() => existsSync(join(root, 'ready.json')), 5_000);
+      info = jsonFile<typeof info>(join(root, 'ready.json'))!;
+      exit1 = await killAndWait(daemon1);
+    } finally {
+      if (daemon1.exitCode === null && daemon1.signalCode === null) daemon1.kill('SIGKILL');
+    }
+    expect(exit1.signal).toBe('SIGKILL');
+
+    // Daemon 2 enters recover() takeover critical window and is SIGKILLed before committing.
+    const takeoverReadyPath = join(root, 'takeover-ready.json');
+    const daemon2 = spawn(process.execPath, [workerPath, 'daemon_takeover_window', root, takeoverReadyPath], { stdio: 'ignore' });
+    let takeoverInfo: { epoch: number; runId: string; pid: number };
+    let exit2: { code: number | null; signal: NodeJS.Signals | null };
+    try {
+      await until(() => existsSync(takeoverReadyPath), 5_000);
+      takeoverInfo = jsonFile<typeof takeoverInfo>(takeoverReadyPath)!;
+      exit2 = await killAndWait(daemon2);
+    } finally {
+      if (daemon2.exitCode === null && daemon2.signalCode === null) daemon2.kill('SIGKILL');
+    }
+    expect(exit2.signal).toBe('SIGKILL');
+    expect(exit2.code).toBeNull();
+    expect(alive(info.shim)).toBe(true);
+    expect(alive(info.endpoint)).toBe(true);
+
+    // Daemon 3 recovers cleanly after Daemon 2 crashed mid-takeover.
+    const recovered = new Runtime({ root, preserve: markerPreserver, timing: { exitMs: 120, killMs: 70, graceMs: 70 } });
+    allocations.push({ root, runtime: recovered });
+    await recovered.recover();
+
+    expect(recovered.epoch).toBeGreaterThan(takeoverInfo.epoch);
+    const run = recovered.store.get(info.runId);
+    expect(run.state).toBe('running');
+    expect(run.segment).toBe(1);
+    expect(run.launchAttempts).toBe(0);
+
+    const facts = recovered.host.facts(run.runDir, 1);
+    expect(facts.shimAlive).toBe(true);
+    expect(facts.endpointAlive).toBe(true);
+    expect(facts.status?.shim).toEqual(info.shim);
+
+    const dupConsumed = recovered.store.db
+      .prepare('SELECT seq, COUNT(*) c FROM consumed WHERE run_id=? AND segment=1 GROUP BY seq HAVING c > 1')
+      .all(info.runId);
+    expect(dupConsumed).toHaveLength(0);
 
     recovered.stop(info.runId);
     const cancelled = await state(recovered, info.runId, 'cancelled');

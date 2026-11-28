@@ -80,13 +80,22 @@ if (mode === 'wal_write_mid_tx') {
   const store = new Store(dbPath);
   writeFileSync(ndjsonPath, frame(1, 'session.started', { native_session_id: null, native_version: null, model: null, reasoning_effort: {} }));
   ingest(store, runId, ndjsonPath);
-  for (let seq = 2; seq <= 200; seq++) {
+  for (let seq = 2; seq <= 10; seq++) {
     appendFileSync(ndjsonPath, frame(seq, 'usage', { ...emptyUsage(), input_tokens: seq * 10, steps: seq - 1 }));
     ingest(store, runId, ndjsonPath);
-    if (seq === 10) {
-      durableJson(readyPath, { seq });
-    }
   }
+  appendFileSync(ndjsonPath, frame(11, 'usage', { ...emptyUsage(), input_tokens: 110, steps: 10 }));
+  // Enter uncommitted seq-advancing transaction window and wait for SIGKILL.
+  store.transaction(() => {
+    const run = store.get(runId);
+    run.usage = { ...run.usage, input_tokens: 110, steps: 10 };
+    store.put(run);
+    store.emit('run.usage', { usage: run.usage, uncommitted: true }, run);
+    store.db.prepare('INSERT INTO consumed VALUES (?,?,?,?,?)').run(runId, 1, 11, 'uncommitted', 9999);
+    store.db.prepare('UPDATE cursors SET last_seq=11 WHERE run_id=? AND segment=1').run(runId);
+    durableJson(readyPath, { seq: 10, uncommittedSeq: 11, pid: process.pid });
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30_000);
+  });
 } else if (mode === 'daemon_live_run') {
   const [root, workspace] = args;
   const runtime = new Runtime({
@@ -115,6 +124,20 @@ if (mode === 'wal_write_mid_tx') {
     runtime.close();
     process.exit(0);
   });
+} else if (mode === 'daemon_takeover_window') {
+  const [root, readyPath] = args;
+  const runtime = new Runtime({
+    root,
+    preserve: async (_run, kind) => ({ state: 'saved', kind, sha: null, error: null }),
+    timing: { exitMs: 120, killMs: 70, graceMs: 70 },
+  });
+  runtime.setRecoverHook((stage, run) => {
+    if (stage === 'before_takeover_commit') {
+      durableJson(readyPath, { epoch: runtime.epoch, runId: run.id, pid: process.pid });
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30_000);
+    }
+  });
+  await runtime.recover();
 } else {
   throw new Error(`unknown_mode: ${mode}`);
 }

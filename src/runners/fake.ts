@@ -19,15 +19,20 @@ function reportModel(): Record<string, unknown> {
   return { requested: params.model.id, effective, effective_source: effective === null ? 'unknown' : 'native_reported', auxiliary: [], evidence: effective === null ? null : 'fake_scenario' };
 }
 function reportEffort(): Record<string, unknown> {
+  if (process.env.MAC_FAKE_EFFORT_REPORTING === 'none') {
+    return { requested: params.reasoning_effort.effort, requested_native: params.reasoning_effort.native,
+      effective: null, effective_native: null, effective_source: 'unknown' };
+  }
   const effective = script.effort_effective === undefined ? (params.reasoning_effort.effort === 'default' ? 'high' : params.reasoning_effort.effort) : script.effort_effective;
   const mapping: Record<string, string> = { low: 'l', medium: 'm', high: 'h' };
   return { requested: params.reasoning_effort.effort, requested_native: params.reasoning_effort.native,
     effective, effective_native: effective === null ? null : mapping[effective] ?? null, effective_source: effective === null ? 'unknown' : 'native_reported' };
 }
-function finish(outcome: Finished['outcome'], error: Finished['error'] = null, message: string | null = null, token: string | null = null): void {
+function finish(outcome: Finished['outcome'], error: Finished['error'] = null, message: string | null = null, token: string | null = null, nativeExit: { code: number | null; signal: string | null } = { code: 0, signal: null }): void {
   if (finished || !started) return;
   usage = { ...usage, steps, turns, completeness: 'exact' };
-  event('run.finished', { outcome, error, work_started: workStarted, final_message: message, usage, model: reportModel(), reasoning_effort: reportEffort(), steps, turns, resume_token: token, native_session_id: `fake-${params.run_id}`, native_exit: { code: 0, signal: null } } satisfies Finished);
+  const nativeSessionId = script?.native_session_id !== undefined ? script.native_session_id : `fake-${params.run_id}`;
+  event('run.finished', { outcome, error, work_started: workStarted, final_message: message, usage, model: reportModel(), reasoning_effort: reportEffort(), steps, turns, resume_token: token, native_session_id: nativeSessionId, native_exit: nativeExit } satisfies Finished);
   finished = true; waiting = false; inputResolve?.();
 }
 function step(): boolean {
@@ -64,6 +69,37 @@ async function execute(index = 0): Promise<void> {
       case 'spawn_child':
         spawn(process.execPath, ['-e', `process.on('SIGTERM',()=>{}); setTimeout(()=>{}, ${Number(op.sleep_ms ?? 60_000)})`], { stdio: 'ignore', env: {} }); break;
       case 'crash': process.exit(Number(op.exit_code ?? 1)); break;
+      case 'native_crash': {
+        const stub = process.env.MAC_FAKE_NATIVE_STUB;
+        const exitCode = Number(op.exit_code ?? 42);
+        const exit = await new Promise<{ code: number | null; signal: string | null }>(resolve => {
+          const child = stub
+            ? spawn(process.execPath, [stub], { stdio: 'ignore', env: { ...process.env, MAC_NATIVE_EXIT_CODE: String(exitCode) } })
+            : spawn(process.execPath, ['-e', `process.exit(${exitCode})`], { stdio: 'ignore', env: {} });
+          child.once('exit', (code, signal) => resolve({ code, signal }));
+        });
+        finish('failed', { code: 'runner_crash', category: 'runner', retryable: false, scope: 'run', message: 'native process crashed', evidence: { exit_code: exit.code, signal: exit.signal } }, null, null, exit);
+        return;
+      }
+      case 'model_changed': {
+        const nextModel = op.model_effective !== undefined ? (op.model_effective as string | null) : script.model_effective;
+        if (nextModel !== undefined) script.model_effective = nextModel;
+        const payload: Record<string, unknown> = {
+          model: {
+            requested: params.model.id,
+            effective: nextModel ?? null,
+            effective_source: nextModel === null || nextModel === undefined ? 'unknown' : 'native_reported',
+            evidence: op.evidence ?? 'native_model_switch',
+          },
+          reason: op.reason ?? 'fallback',
+        };
+        if (op.effort_effective !== undefined) {
+          script.effort_effective = op.effort_effective as string | null;
+          payload.reasoning_effort = reportEffort();
+        }
+        event('model.changed', payload);
+        break;
+      }
       case 'emit_raw': process.stdout.write(`${String(op.line)}\n`); break;
       case 'hang': await new Promise<void>(() => {}); break;
       default: throw new Error(`not_implemented: scenario.${op.op}`);
@@ -94,7 +130,10 @@ function validate(p: Record<string, unknown>, partial = false): void {
   if (s.reasoning_effort.native !== mapped[s.reasoning_effort.effort]) reject('EFFORT_UNSUPPORTED', 'reasoning_effort.native');
   if (s.limits.max_steps !== null && (!Number.isSafeInteger(s.limits.max_steps) || s.limits.max_steps < 0)) throw new RpcError(-32602, 'invalid max_steps');
   if (s.resume && mode !== 'resume') reject('RESUME_UNSUPPORTED', 'resume');
-  if (s.resume) { strict(s.resume, ['token','input','usage_baseline']); strict(s.resume.input, ['input_id','text']); }
+  if (s.resume) {
+    strict(s.resume, ['token','input','usage_baseline']); strict(s.resume.input, ['input_id','text']);
+    if (s.resume.usage_baseline !== null && (typeof s.resume.usage_baseline !== 'object' || Array.isArray(s.resume.usage_baseline))) throw new RpcError(-32602, 'invalid usage_baseline');
+  }
   if (s.conformance) strict(s.conformance, ['scenario']);
   if (s.conformance && process.env.MAC_CONFORMANCE !== '1') throw new RpcError(-32006, 'conformance mode disabled');
 }
@@ -103,10 +142,10 @@ function capabilities(): unknown {
   return { runner, account: { id: process.env.MAC_ACCOUNT_ID ?? 'fake', status: 'configured' },
     features: { read_only: { enforceable: false, mechanism: null }, usage: { streaming: true, final_receipt: 'exact', fields: ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens'], native_cost: false },
       cancel: { control_message: true, grace_s: 10 }, interaction: { modes: ['autonomous', 'interactive'], input: mode, holds_slot_while_waiting: mode === 'stdin', mid_turn_input: false },
-      model_reporting: 'session', effort_reporting: 'session', limits: { max_steps: true }, forbidden_enforcement: [], raw_capture: false, events: { reasoning: true, file_changes: false } },
+      model_reporting: 'session', effort_reporting: process.env.MAC_FAKE_EFFORT_REPORTING === 'none' ? 'none' : 'session', limits: { max_steps: true }, forbidden_enforcement: [], raw_capture: false, events: { reasoning: true, file_changes: false } },
     models: [{ id: 'fake-high', tier: 'high', aliases: [], efforts: [{ effort: 'low', native: 'l' }, { effort: 'medium', native: 'm' }, { effort: 'high', native: 'h' }], default_effort: 'high', availability: 'assumed', verified_at: null }],
     catalog: { source: 'static', fetched_at: null, note: 'D1 subset' }, probe: { levels: ['auth'], components: ['auth'] },
-    conformance: { native_override: false, scenarios: true }, extensions: [] };
+    conformance: { native_override: true, scenarios: true }, extensions: [] };
 }
 const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 lines.on('line', line => {
@@ -136,7 +175,13 @@ lines.on('line', line => {
           try { validate(p.start as Record<string, unknown>, true); result = { ok: true, violations: [], warnings: [] }; }
           catch (e) { if (!(e instanceof RpcError) || e.code !== -32005) throw e; result = { ok: false, ...(e.data as object), warnings: [] }; }
           break;
-        case 'probe': strict(p, ['level']); if (p.level !== 'auth') throw new RpcError(-32005, 'probe not implemented'); result = { level: 'auth', status: 'ok', billable: false, components: [{ id: 'auth', status: 'ok', detail: 'synthetic fake account', error: null }], observed: null, checked_at: new Date().toISOString() }; break;
+        case 'probe':
+          strict(p, ['level']);
+          if (p.level !== 'auth') throw new RpcError(-32005, 'probe not implemented');
+          result = process.env.MAC_FAKE_PROBE_STATUS === 'failed'
+            ? { level: 'auth', status: 'failed', billable: false, components: [{ id: 'auth', status: 'failed', detail: 'synthetic auth failure', error: { code: 'auth_failed', category: 'auth', retryable: false, scope: 'account', message: 'synthetic auth failure' } }], observed: null, checked_at: new Date().toISOString() }
+            : { level: 'auth', status: 'ok', billable: false, components: [{ id: 'auth', status: 'ok', detail: 'synthetic fake account', error: null }], observed: null, checked_at: new Date().toISOString() };
+          break;
         case 'run.start': {
           if (started) throw new RpcError(-32003, 'already_started');
           validate(p); params = p as unknown as StartParams;
@@ -146,10 +191,14 @@ lines.on('line', line => {
           if (params.resume) {
             if (mode !== 'resume') throw new RpcError(-32005, 'resume unsupported');
             const saved = JSON.parse(Buffer.from(params.resume.token, 'base64url').toString('utf8')) as { script: Scenario; index: number; turns: number };
-            script = scenario(saved.script); index = saved.index; turns = saved.turns;
+            if (!params.conformance?.scenario) {
+              script = scenario(saved.script);
+            }
+            index = saved.index; turns = saved.turns;
           }
-          started = true; send({ jsonrpc: '2.0', id, result: { accepted: true, native_session_id: `fake-${params.run_id}` } });
-          event('session.started', { native_session_id: `fake-${params.run_id}`, native_version: null, model: reportModel(), reasoning_effort: reportEffort() });
+          const nativeSessionId = script.native_session_id !== undefined ? script.native_session_id : `fake-${params.run_id}`;
+          started = true; send({ jsonrpc: '2.0', id, result: { accepted: true, native_session_id: nativeSessionId } });
+          event('session.started', { native_session_id: nativeSessionId, native_version: null, model: reportModel(), reasoning_effort: reportEffort() });
           void execute(index).catch(error => finish('failed', { code: 'runner_internal', message: String(error) })); return;
         }
         case 'run.input': {

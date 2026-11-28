@@ -50,6 +50,10 @@ export class Runtime {
     this.beforeFinalizeHook = before;
     this.finalizedHook = after;
   }
+  private recoverHook: ((stage: 'before_takeover_commit', run: Run) => void) | null = null;
+  setRecoverHook(hook: (stage: 'before_takeover_commit', run: Run) => void): void {
+    this.recoverHook = hook;
+  }
   private finalizeRun(run: Run, preservationOK = true, now = Date.now()): void {
     if (candidateOutcome(run).state !== 'waiting') {
       if (run.segment > 0) run.workspaceHead = workspaceState(run.workspace).head;
@@ -254,7 +258,12 @@ export class Runtime {
           this.store.put(r); stateEvent(this.store, r, from, Date.now());
         });
       } else if (facts.shimAlive) {
-        this.store.transaction(() => { r.intent!.status = 'spawned'; this.store.put(r); this.store.emit('alert', { kind: 'recovery', run_id: r.id }, r); });
+        this.store.transaction(() => {
+          r.intent!.status = 'spawned';
+          this.store.put(r);
+          this.store.emit('alert', { kind: 'recovery', run_id: r.id }, r);
+          this.recoverHook?.('before_takeover_commit', r);
+        });
         this.flushCommands(r);
       } else if (fence !== 'busy') {
         // Existing directory proves possible execution: never reissue this segment.
