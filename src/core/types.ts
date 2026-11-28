@@ -46,6 +46,10 @@ export interface Run {
   cleanupTermAt: number | null; outputDrained: boolean; groupEmpty: boolean;
   workspaceHead: string | null; hadWorkEvents: boolean;
   workspace: string; runDir: string; prompt: string; maxSteps: number | null;
+  readOnly?: boolean; forbidden?: string[]; modelAliases?: string[];
+  reportedModel?: { requested?: string | null; effective?: string | null; effective_source?: string | null; auxiliary?: string[]; evidence?: unknown };
+  reportedEffort?: { requested?: string | null; requested_native?: string | null; effective?: string | null; effective_native?: string | null; effective_source?: string | null };
+  modelMismatchAlerted?: boolean; effortMismatchAlerted?: boolean;
 }
 export interface RunnerEvent { seq: number; ts: string; type: string; data: Record<string, unknown> }
 export interface StartParams {

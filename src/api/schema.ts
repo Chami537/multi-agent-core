@@ -40,6 +40,7 @@ export function ensureApiSchema(db: DatabaseSync): void {
       permanent INTEGER NOT NULL,
       status_code INTEGER,
       response_body TEXT,
+      project_id TEXT,
       created_at INTEGER NOT NULL,
       completed_at INTEGER,
       PRIMARY KEY (principal, method, path, idempotency_key)
@@ -67,4 +68,8 @@ export function ensureApiSchema(db: DatabaseSync): void {
       created_at INTEGER NOT NULL
     );
   `);
+  const idemCols = db.prepare(`PRAGMA table_info(api_idempotency)`).all() as { name: string }[];
+  if (!idemCols.some(c => c.name === 'project_id')) {
+    db.exec(`ALTER TABLE api_idempotency ADD COLUMN project_id TEXT`);
+  }
 }

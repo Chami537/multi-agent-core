@@ -47,14 +47,23 @@ import {
   checkTaskCreatePhase1,
   collectRunSpecUnknownFields,
   collectTaskCreateUnknownFields,
+  CONTINUE_FIELDS,
+  DEGRADE_FIELDS,
   findUnknownFields,
+  OVERRIDES_FIELDS,
+  PATCH_RUN_FIELDS,
+  TIMEOUTS_FIELDS,
   validateRunSpec,
+  validateRunSpecTypes,
   validateTaskLevel,
 } from './validation.js';
 import {
+  checkInPlaceWorkspace,
   executeWorktreeRelease,
   getReleaseState,
-  saveReleaseState,
+  prepareRunWorktree,
+  recoverWorktreeReleases,
+  saveReleaseRecord,
   verifyWorktreePreservation,
 } from './worktree.js';
 
@@ -143,9 +152,39 @@ export function createApiServer(config: ServerConfig): ApiServer {
     return row ? (JSON.parse(row.payload) as RunMetadata) : null;
   };
 
+  runtime.setPrepareStart((run, now) => {
+    const meta = getRunMeta(run.id);
+    const project = projectMap.get(run.projectId);
+    if (!meta || !project) return;
+    const repoRoot = resolve(project.workspace_path);
+    if (meta.workspace_mode === 'worktree') {
+      const worktreePath = join(run.runDir, 'worktree');
+      const { baseSha } = prepareRunWorktree({
+        repoRoot,
+        worktreePath,
+        branch: meta.branch,
+        base: meta.base,
+      });
+      meta.base.sha = baseSha;
+      meta.base.resolved_at = new Date(now).toISOString();
+      meta.started_at = meta.started_at ?? new Date(now).toISOString();
+      store.transaction(() => {
+        store.db.prepare('UPDATE api_runs SET payload=? WHERE id=?').run(JSON.stringify(meta), run.id);
+      });
+      return { workspace: worktreePath };
+    }
+    checkInPlaceWorkspace({ repoRoot, store, projectId: project.id, runId: run.id });
+    meta.started_at = meta.started_at ?? new Date(now).toISOString();
+    store.transaction(() => {
+      store.db.prepare('UPDATE api_runs SET payload=? WHERE id=?').run(JSON.stringify(meta), run.id);
+    });
+    return { workspace: repoRoot };
+  });
+
   const buildRunFromSpec = (params: {
     runId: string;
     taskId: string;
+    taskLevel: Level;
     project: ProjectConfig;
     spec: Record<string, unknown>;
     principal: AuthPrincipal;
@@ -153,9 +192,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
     continues?: { run_id: string; mode: string; sha: string | null } | null;
     lineage?: RunMetadata['lineage'];
   }): { run: Run; meta: RunMetadata; warnings: WarningItem[] } => {
-    const { runId, taskId, project, spec, principal, now } = params;
-    const taskRow = getTaskRow(taskId);
-    const taskLevel = taskRow ? (JSON.parse(taskRow.payload) as TaskRecord).level : ('L2' as Level);
+    const { runId, taskId, taskLevel, project, spec, principal, now } = params;
     const check = validateRunSpec({
       spec,
       pathPrefix: 'run',
@@ -179,6 +216,10 @@ export function createApiServer(config: ServerConfig): ApiServer {
     const inputMode = resolved.interaction === 'interactive'
       ? (resolved.runner.features.interaction.input === 'stdin' ? 'stdin' : 'resume')
       : 'none';
+    const readOnlyDegraded = primary.degraded.some(d => d.capability === 'read_only');
+    const enforcedForbidden = Object.entries(primary.forbidden_guarantee)
+      .filter(([, levels]) => levels.includes('enforced'))
+      .map(([act]) => act);
 
     const run: Run = {
       id: runId,
@@ -219,6 +260,9 @@ export function createApiServer(config: ServerConfig): ApiServer {
       runDir,
       prompt: String(spec.instructions),
       maxSteps: null,
+      readOnly: resolved.read_only && !readOnlyDegraded,
+      forbidden: enforcedForbidden,
+      modelAliases: primary.aliases,
     };
     assertTransition(null, 'queued', 'T1');
 
@@ -551,6 +595,17 @@ export function createApiServer(config: ServerConfig): ApiServer {
         });
         return;
       }
+      const runsInput = Array.isArray(bodyObj.runs) ? bodyObj.runs : [];
+      const typeViolations: Violation[] = [];
+      runsInput.forEach((r, i) => {
+        if (r && typeof r === 'object' && !Array.isArray(r)) {
+          typeViolations.push(...validateRunSpecTypes(r as Record<string, unknown>, `runs[${i}]`, false));
+        }
+      });
+      if (typeViolations.length > 0) {
+        sendError(res, { status: 400, code: 'invalid_request', message: typeViolations[0]!.message, requestId, details: { violations: typeViolations }, headers: respHeaders });
+        return;
+      }
       if (Array.isArray(bodyObj.runs)) {
         for (let i = 0; i < bodyObj.runs.length; i++) {
           const r = bodyObj.runs[i];
@@ -586,7 +641,6 @@ export function createApiServer(config: ServerConfig): ApiServer {
       const violations: Violation[] = [...validateTaskLevel(level, project)];
       const warnings: WarningItem[] = [];
       const resolvedList: unknown[] = [];
-      const runsInput = Array.isArray(bodyObj.runs) ? bodyObj.runs : [];
       runsInput.forEach((r, i) => {
         if (!r || typeof r !== 'object' || Array.isArray(r)) {
           violations.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: `runs[${i}]`, message: 'RunSpec must be an object' });
@@ -621,7 +675,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
     // Helper for Idempotency-Key wrapped write handlers
     const withIdempotency = async (
       permanent: boolean,
-      fn: (scope: IdempotencyScope) => Promise<{ status: number; body: unknown; headers?: Record<string, string>; alreadyCommittedInTx?: boolean }>,
+      fn: (scope: IdempotencyScope) => Promise<{ status: number; body: unknown; headers?: Record<string, string>; alreadyCommittedInTx?: boolean; projectId?: string | null }>,
     ): Promise<void> => {
       const keyCheck = validateIdempotencyKey(req.headers['idempotency-key']);
       if (!keyCheck.ok) {
@@ -644,6 +698,16 @@ export function createApiServer(config: ServerConfig): ApiServer {
 
       const acquired = idempotency.checkAndAcquire(scope, fingerprint, requestId, permanent);
       if (acquired.action === 'replay') {
+        if (acquired.projectId && !tokens.allowsProject(principal, acquired.projectId)) {
+          sendError(res, {
+            status: 403,
+            code: 'project_not_authorized',
+            message: 'Token is not authorized for the project associated with this idempotent response',
+            requestId,
+            headers: respHeaders,
+          });
+          return;
+        }
         sendJson(res, acquired.statusCode, acquired.body, { ...respHeaders, 'Idempotent-Replayed': 'true' });
         return;
       }
@@ -676,7 +740,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
         const bodyStr = typeof result.body === 'string' ? result.body : JSON.stringify(result.body);
         if (shouldRecordStatus(result.status)) {
           if (!result.alreadyCommittedInTx) {
-            idempotency.completeStandalone(scope, result.status, bodyStr);
+            idempotency.completeStandalone(scope, result.status, bodyStr, Date.now(), result.projectId ?? null);
           }
           idempotency.releaseInFlight(scope, false);
         } else {
@@ -699,18 +763,28 @@ export function createApiServer(config: ServerConfig): ApiServer {
     // O-06: POST /v0/tasks
     if (method === 'POST' && path === '/v0/tasks') {
       if (!requireScope('submit')) return;
-      const unknown = collectTaskCreateUnknownFields(bodyObj);
-      if (unknown.length > 0) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields in request', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
-        return;
-      }
-      const oop = checkTaskCreatePhase1(bodyObj);
-      if (oop) {
-        sendError(res, { status: 501, code: 'not_implemented', message: 'Request contains fields not implemented in Phase 1', requestId, details: { paths: oop.paths, available_in: oop.availableIn }, headers: respHeaders });
-        return;
-      }
 
       await withIdempotency(true, async scope => {
+        const unknown = collectTaskCreateUnknownFields(bodyObj);
+        if (unknown.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Unknown fields in request', retryable: false, retry_after_s: null, request_id: requestId, details: { unknown_fields: unknown } } } };
+        }
+        const preRunsInput = bodyObj.runs ?? [];
+        if (Array.isArray(preRunsInput)) {
+          const typeErrs: Violation[] = [];
+          preRunsInput.forEach((r, i) => {
+            if (r && typeof r === 'object' && !Array.isArray(r)) {
+              typeErrs.push(...validateRunSpecTypes(r as Record<string, unknown>, `runs[${i}]`, false));
+            }
+          });
+          if (typeErrs.length > 0) {
+            return { status: 400, body: { error: { code: 'invalid_request', message: typeErrs[0]!.message, retryable: false, retry_after_s: null, request_id: requestId, details: { violations: typeErrs } } } };
+          }
+        }
+        const oop = checkTaskCreatePhase1(bodyObj);
+        if (oop) {
+          return { status: 501, body: { error: { code: 'not_implemented', message: 'Request contains fields not implemented in Phase 1', retryable: false, retry_after_s: null, request_id: requestId, details: { paths: oop.paths, available_in: oop.availableIn } } } };
+        }
         const projectId = bodyObj.project_id;
         if (typeof projectId !== 'string' || !projectMap.has(projectId) || !tokens.allowsProject(principal, projectId)) {
           return {
@@ -751,9 +825,9 @@ export function createApiServer(config: ServerConfig): ApiServer {
               const respBody = { task: serializeTask(task, task.run_ids.map(rid => store.get(rid))), runs: taskRuns, warnings: [] };
               const respStr = JSON.stringify(respBody);
               store.transaction(() => {
-                idempotency.completeInTransaction(scope, 200, respStr);
+                idempotency.completeInTransaction(scope, 200, respStr, Date.now(), project.id);
               });
-              return { status: 200, body: respStr, headers: { 'Client-Ref-Replayed': 'true' }, alreadyCommittedInTx: true };
+              return { status: 200, body: respStr, headers: { 'Client-Ref-Replayed': 'true' }, alreadyCommittedInTx: true, projectId: project.id };
             }
             return {
               status: 409,
@@ -767,6 +841,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
                   details: { existing_task_id: existing.id },
                 },
               },
+              projectId: project.id,
             };
           }
         }
@@ -838,10 +913,11 @@ export function createApiServer(config: ServerConfig): ApiServer {
 
         const now = Date.now();
         const taskId = ulid('task', now);
+        const taskLevel = bodyObj.level as Level;
         const createdRuns: { run: Run; meta: RunMetadata }[] = [];
         for (const r of runsInput as Record<string, unknown>[]) {
           const runId = ulid('run', now);
-          const built = buildRunFromSpec({ runId, taskId, project, spec: r, principal, now });
+          const built = buildRunFromSpec({ runId, taskId, taskLevel, project, spec: r, principal, now });
           createdRuns.push({ run: built.run, meta: built.meta });
         }
 
@@ -852,7 +928,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
           title: String(bodyObj.title),
           goal: String(bodyObj.goal),
           constraints: (constraints as string[]).slice(),
-          level: bodyObj.level as Level,
+          level: taskLevel,
           budget: null,
           state: 'open',
           outcome: null,
@@ -875,7 +951,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
           store.db
             .prepare('INSERT INTO api_tasks(id, project_id, principal, client_ref, request_fingerprint, payload, created_at) VALUES (?,?,?,?,?,?,?)')
             .run(task.id, task.project_id, principal.principal, clientRef, bodyFingerprint, JSON.stringify(task), now);
-          store.emit('task.created', { task: respPayload.task, version: 1 }, null, now);
+          store.emit('task.created', { task: respPayload.task, version: 1 }, { projectId: task.project_id, taskId: task.id }, now);
           for (let i = 0; i < createdRuns.length; i++) {
             const { run, meta } = createdRuns[i]!;
             const specFp = sha256Hex(canonicalJson((runsInput as unknown[])[i]));
@@ -886,10 +962,10 @@ export function createApiServer(config: ServerConfig): ApiServer {
             store.emit('run.created', { run: respPayload.runs[i], version: run.version }, run, now);
             stateEvent(store, run, null, now);
           }
-          idempotency.completeInTransaction(scope, 201, respStr, now);
+          idempotency.completeInTransaction(scope, 201, respStr, now, project.id);
         });
 
-        return { status: 201, body: respStr, alreadyCommittedInTx: true };
+        return { status: 201, body: respStr, alreadyCommittedInTx: true, projectId: project.id };
       });
       return;
     }
@@ -993,7 +1069,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
       const serialized = store.transaction(() => {
         store.db.prepare('UPDATE api_tasks SET payload=? WHERE id=?').run(JSON.stringify(task), task.id);
         const s = serializeTask(task, task.run_ids.map(rid => store.get(rid)));
-        store.emit('task.updated', { task: s, version: task.version }, null);
+        store.emit('task.updated', { task: s, version: task.version }, { projectId: task.project_id, taskId: task.id });
         return s;
       });
       sendJson(res, 200, serialized, { ...respHeaders, ETag: `"${task.version}"` });
@@ -1005,32 +1081,39 @@ export function createApiServer(config: ServerConfig): ApiServer {
     if (method === 'POST' && taskRunsMatch) {
       if (!requireScope('submit')) return;
       const taskId = taskRunsMatch[1]!;
-      const unknown = findUnknownFields(bodyObj, ['runs']);
-      if (Array.isArray(bodyObj.runs)) {
-        bodyObj.runs.forEach((r, i) => {
-          if (r && typeof r === 'object' && !Array.isArray(r)) {
-            unknown.push(...collectRunSpecUnknownFields(r as Record<string, unknown>, `runs[${i}]`));
+
+      await withIdempotency(true, async scope => {
+        const unknown = findUnknownFields(bodyObj, ['runs']);
+        if (Array.isArray(bodyObj.runs)) {
+          bodyObj.runs.forEach((r, i) => {
+            if (r && typeof r === 'object' && !Array.isArray(r)) {
+              unknown.push(...collectRunSpecUnknownFields(r as Record<string, unknown>, `runs[${i}]`));
+            }
+          });
+        }
+        if (unknown.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Unknown fields in request', retryable: false, retry_after_s: null, request_id: requestId, details: { unknown_fields: unknown } } } };
+        }
+        if (Array.isArray(bodyObj.runs)) {
+          const typeErrs: Violation[] = [];
+          bodyObj.runs.forEach((r, i) => {
+            if (r && typeof r === 'object' && !Array.isArray(r)) {
+              typeErrs.push(...validateRunSpecTypes(r as Record<string, unknown>, `runs[${i}]`, false));
+            }
+          });
+          if (typeErrs.length > 0) {
+            return { status: 400, body: { error: { code: 'invalid_request', message: typeErrs[0]!.message, retryable: false, retry_after_s: null, request_id: requestId, details: { violations: typeErrs } } } };
           }
-        });
-      }
-      if (unknown.length > 0) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields in request', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
-        return;
-      }
-      if (Array.isArray(bodyObj.runs)) {
-        for (let i = 0; i < bodyObj.runs.length; i++) {
-          const r = bodyObj.runs[i];
-          if (r && typeof r === 'object' && !Array.isArray(r)) {
-            const oop = checkRunSpecPhase1(r as Record<string, unknown>, `runs[${i}]`);
-            if (oop) {
-              sendError(res, { status: 501, code: 'not_implemented', message: 'Request contains fields not implemented in Phase 1', requestId, details: { paths: oop.paths, available_in: oop.availableIn }, headers: respHeaders });
-              return;
+          for (let i = 0; i < bodyObj.runs.length; i++) {
+            const r = bodyObj.runs[i];
+            if (r && typeof r === 'object' && !Array.isArray(r)) {
+              const oop = checkRunSpecPhase1(r as Record<string, unknown>, `runs[${i}]`);
+              if (oop) {
+                return { status: 501, body: { error: { code: 'not_implemented', message: 'Request contains fields not implemented in Phase 1', retryable: false, retry_after_s: null, request_id: requestId, details: { paths: oop.paths, available_in: oop.availableIn } } } };
+              }
             }
           }
         }
-      }
-
-      await withIdempotency(true, async scope => {
         const row = getTaskRow(taskId);
         if (!row) {
           return { status: 404, body: { error: { code: 'not_found', message: 'Task not found', retryable: false, retry_after_s: null, request_id: requestId } } };
@@ -1040,12 +1123,25 @@ export function createApiServer(config: ServerConfig): ApiServer {
           return { status: 404, body: { error: { code: 'not_found', message: 'Task not found', retryable: false, retry_after_s: null, request_id: requestId } } };
         }
         if (task.state !== 'open') {
-          return { status: 409, body: { error: { code: 'invalid_state', message: `Task is ${task.state}, cannot append runs`, retryable: false, retry_after_s: null, request_id: requestId, details: { state: task.state } } } };
+          return { status: 409, body: { error: { code: 'invalid_state', message: `Task is ${task.state}, cannot append runs`, retryable: false, retry_after_s: null, request_id: requestId, details: { state: task.state } } }, projectId: task.project_id };
         }
         const project = projectMap.get(task.project_id)!;
         const runsInput = bodyObj.runs;
         if (!Array.isArray(runsInput) || runsInput.length === 0 || runsInput.length > 50) {
-          return { status: 400, body: { error: { code: 'invalid_request', message: 'runs must be a non-empty array of <= 50 RunSpecs', retryable: false, retry_after_s: null, request_id: requestId } } };
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'runs must be a non-empty array of <= 50 RunSpecs', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
+        }
+
+        // Intra-batch duplicate client_ref check (R2)
+        const seenBatchRefs = new Set<string>();
+        for (let i = 0; i < runsInput.length; i++) {
+          const r = runsInput[i];
+          if (r && typeof r === 'object' && typeof (r as Record<string, unknown>).client_ref === 'string') {
+            const cr = (r as Record<string, unknown>).client_ref as string;
+            if (seenBatchRefs.has(cr)) {
+              return { status: 400, body: { error: { code: 'invalid_request', message: `Duplicate client_ref '${cr}' in batch at runs[${i}]`, retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
+            }
+            seenBatchRefs.add(cr);
+          }
         }
 
         // Check run client_ref uniqueness within task
@@ -1067,6 +1163,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
                     details: { existing_run_id: dup.id, same_body: sameBody },
                   },
                 },
+                projectId: task.project_id,
               };
             }
           }
@@ -1087,6 +1184,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
           return {
             status: 422,
             body: { error: { code: 'validation_failed', message: `${violations.length} validation error(s)`, retryable: false, retry_after_s: null, request_id: requestId, violations } },
+            projectId: task.project_id,
           };
         }
 
@@ -1094,7 +1192,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
         const createdRuns: { run: Run; meta: RunMetadata }[] = [];
         for (const r of runsInput as Record<string, unknown>[]) {
           const runId = ulid('run', now);
-          const built = buildRunFromSpec({ runId, taskId: task.id, project, spec: r, principal, now });
+          const built = buildRunFromSpec({ runId, taskId: task.id, taskLevel: task.level, project, spec: r, principal, now });
           createdRuns.push({ run: built.run, meta: built.meta });
         }
         task.run_ids.push(...createdRuns.map(x => x.run.id));
@@ -1114,10 +1212,10 @@ export function createApiServer(config: ServerConfig): ApiServer {
             store.emit('run.created', { run: respRuns[i], version: run.version }, run, now);
             stateEvent(store, run, null, now);
           }
-          idempotency.completeInTransaction(scope, 201, respStr, now);
+          idempotency.completeInTransaction(scope, 201, respStr, now, project.id);
         });
 
-        return { status: 201, body: respStr, alreadyCommittedInTx: true };
+        return { status: 201, body: respStr, alreadyCommittedInTx: true, projectId: project.id };
       });
       return;
     }
@@ -1127,12 +1225,11 @@ export function createApiServer(config: ServerConfig): ApiServer {
     if (method === 'POST' && taskCancelMatch) {
       if (!requireScope('control')) return;
       const taskId = taskCancelMatch[1]!;
-      const unknown = findUnknownFields(bodyObj, ['reason']);
-      if (unknown.length > 0) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
-        return;
-      }
-      await withIdempotency(false, async () => {
+      await withIdempotency(false, async scope => {
+        const unknown = findUnknownFields(bodyObj, ['reason']);
+        if (unknown.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Unknown fields', retryable: false, retry_after_s: null, request_id: requestId, details: { unknown_fields: unknown } } } };
+        }
         const row = getTaskRow(taskId);
         if (!row) return { status: 404, body: { error: { code: 'not_found', message: 'Task not found', retryable: false, retry_after_s: null, request_id: requestId } } };
         const task = JSON.parse(row.payload) as TaskRecord;
@@ -1140,26 +1237,31 @@ export function createApiServer(config: ServerConfig): ApiServer {
           return { status: 404, body: { error: { code: 'not_found', message: 'Task not found', retryable: false, retry_after_s: null, request_id: requestId } } };
         }
         if (task.state !== 'open') {
-          return { status: 409, body: { error: { code: 'invalid_state', message: `Task is already ${task.state}`, retryable: false, retry_after_s: null, request_id: requestId, details: { state: task.state } } } };
+          return { status: 409, body: { error: { code: 'invalid_state', message: `Task is already ${task.state}`, retryable: false, retry_after_s: null, request_id: requestId, details: { state: task.state } } }, projectId: task.project_id };
+        }
+        if (bodyObj.reason !== undefined && typeof bodyObj.reason !== 'string') {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'reason must be a string', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
         }
         const reason = typeof bodyObj.reason === 'string' && bodyObj.reason.length > 0 ? bodyObj.reason : 'task_cancelled';
         const now = Date.now();
-        for (const rid of task.run_ids) {
-          const r = store.get(rid);
-          if (!isTerminal(r.state)) {
-            try { runtime.stop(rid, 'cancel', now, false, reason); } catch { /* ignore if finalizing */ }
+        const respStr = store.transaction(() => {
+          for (const rid of task.run_ids) {
+            const r = store.get(rid);
+            if (!isTerminal(r.state)) {
+              try { runtime.stopInTransaction(rid, 'cancel', now, false, reason); } catch { /* ignore if finalizing */ }
+            }
           }
-        }
-        task.state = 'cancelled';
-        task.closed_at = new Date(now).toISOString();
-        task.version++;
-        const serialized = store.transaction(() => {
+          task.state = 'cancelled';
+          task.closed_at = new Date(now).toISOString();
+          task.version++;
           store.db.prepare('UPDATE api_tasks SET payload=? WHERE id=?').run(JSON.stringify(task), task.id);
           const s = serializeTask(task, task.run_ids.map(rid => store.get(rid)));
-          store.emit('task.cancelled', { outcome: { reason }, version: task.version }, null, now);
-          return s;
+          store.emit('task.cancelled', { outcome: { reason }, version: task.version }, { projectId: task.project_id, taskId: task.id }, now);
+          const jsonStr = JSON.stringify(s);
+          idempotency.completeInTransaction(scope, 200, jsonStr, now, task.project_id);
+          return jsonStr;
         });
-        return { status: 200, body: serialized };
+        return { status: 200, body: respStr, alreadyCommittedInTx: true, projectId: task.project_id };
       });
       return;
     }
@@ -1169,16 +1271,21 @@ export function createApiServer(config: ServerConfig): ApiServer {
     if (method === 'POST' && taskCloseMatch) {
       if (!requireScope('decide')) return;
       const taskId = taskCloseMatch[1]!;
-      const unknown = findUnknownFields(bodyObj, ['outcome', 'accepted', 'note', 'cancel_open_runs']);
-      if (unknown.length > 0) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
-        return;
-      }
-      if (bodyObj.outcome === 'accepted') {
-        sendError(res, { status: 501, code: 'not_implemented', message: 'close with outcome=accepted is not implemented in Phase 1', requestId, details: { paths: ['outcome'], available_in: 'Phase 4' }, headers: respHeaders });
-        return;
-      }
       await withIdempotency(false, async scope => {
+        const unknown = findUnknownFields(bodyObj, ['outcome', 'accepted', 'note', 'cancel_open_runs']);
+        if (unknown.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Unknown fields', retryable: false, retry_after_s: null, request_id: requestId, details: { unknown_fields: unknown } } } };
+        }
+        if (bodyObj.cancel_open_runs !== undefined && typeof bodyObj.cancel_open_runs !== 'boolean') {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'cancel_open_runs must be a boolean', retryable: false, retry_after_s: null, request_id: requestId } } };
+        }
+        if (bodyObj.note !== undefined && bodyObj.note !== null && typeof bodyObj.note !== 'string') {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'note must be a string or null', retryable: false, retry_after_s: null, request_id: requestId } } };
+        }
+        if (bodyObj.outcome === 'accepted' || bodyObj.accepted !== undefined) {
+          const paths = bodyObj.outcome === 'accepted' ? ['outcome'] : ['accepted'];
+          return { status: 501, body: { error: { code: 'not_implemented', message: 'close with outcome=accepted is not implemented in Phase 1', retryable: false, retry_after_s: null, request_id: requestId, details: { paths, available_in: 'Phase 4' } } } };
+        }
         const row = getTaskRow(taskId);
         if (!row) return { status: 404, body: { error: { code: 'not_found', message: 'Task not found', retryable: false, retry_after_s: null, request_id: requestId } } };
         const task = JSON.parse(row.payload) as TaskRecord;
@@ -1186,27 +1293,37 @@ export function createApiServer(config: ServerConfig): ApiServer {
           return { status: 404, body: { error: { code: 'not_found', message: 'Task not found', retryable: false, retry_after_s: null, request_id: requestId } } };
         }
         if (task.state !== 'open') {
-          return { status: 409, body: { error: { code: 'invalid_state', message: `Task is ${task.state}`, retryable: false, retry_after_s: null, request_id: requestId } } };
+          return { status: 409, body: { error: { code: 'invalid_state', message: `Task is ${task.state}`, retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
         }
         if (!['abandoned', 'superseded'].includes(String(bodyObj.outcome))) {
-          return { status: 400, body: { error: { code: 'invalid_request', message: 'Invalid outcome', retryable: false, retry_after_s: null, request_id: requestId } } };
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Invalid outcome', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
         }
         const runs = task.run_ids.map(rid => store.get(rid));
         if (runs.some(r => !isTerminal(r.state)) && !bodyObj.cancel_open_runs) {
-          return { status: 409, body: { error: { code: 'invalid_state', message: 'Task still has non-terminal runs', retryable: false, retry_after_s: null, request_id: requestId } } };
+          return { status: 409, body: { error: { code: 'invalid_state', message: 'Task still has non-terminal runs', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
         }
         const now = Date.now();
-        task.state = 'closed';
-        task.outcome = { outcome: bodyObj.outcome, note: bodyObj.note ?? null };
-        task.closed_at = new Date(now).toISOString();
-        task.version++;
-        const respStr = JSON.stringify(serializeTask(task, runs));
-        store.transaction(() => {
+        const respStr = store.transaction(() => {
+          if (bodyObj.cancel_open_runs === true) {
+            for (const rid of task.run_ids) {
+              const r = store.get(rid);
+              if (!isTerminal(r.state)) {
+                try { runtime.stopInTransaction(rid, 'cancel', now, false, 'task_closed'); } catch { /* ignore if finalizing */ }
+              }
+            }
+          }
+          task.state = 'closed';
+          task.outcome = { outcome: bodyObj.outcome, note: bodyObj.note ?? null };
+          task.closed_at = new Date(now).toISOString();
+          task.version++;
+          const latestRuns = task.run_ids.map(rid => store.get(rid));
+          const jsonStr = JSON.stringify(serializeTask(task, latestRuns));
           store.db.prepare('UPDATE api_tasks SET payload=? WHERE id=?').run(JSON.stringify(task), task.id);
-          store.emit('task.closed', { outcome: task.outcome, version: task.version }, null, now);
-          idempotency.completeInTransaction(scope, 200, respStr, now);
+          store.emit('task.closed', { outcome: task.outcome, version: task.version }, { projectId: task.project_id, taskId: task.id }, now);
+          idempotency.completeInTransaction(scope, 200, jsonStr, now, task.project_id);
+          return jsonStr;
         });
-        return { status: 200, body: respStr, alreadyCommittedInTx: true };
+        return { status: 200, body: respStr, alreadyCommittedInTx: true, projectId: task.project_id };
       });
       return;
     }
@@ -1238,15 +1355,14 @@ export function createApiServer(config: ServerConfig): ApiServer {
     if (method === 'POST' && taskRulingsMatch) {
       if (!requireScope('decide')) return;
       const taskId = taskRulingsMatch[1]!;
-      const unknown = findUnknownFields(bodyObj, ['subject', 'decision', 'based_on', 'expected_branch_version', 'note']);
-      if (bodyObj.subject && typeof bodyObj.subject === 'object' && !Array.isArray(bodyObj.subject)) {
-        unknown.push(...findUnknownFields(bodyObj.subject, ['run_id', 'sha'], 'subject'));
-      }
-      if (unknown.length > 0) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
-        return;
-      }
       await withIdempotency(true, async scope => {
+        const unknown = findUnknownFields(bodyObj, ['subject', 'decision', 'based_on', 'expected_branch_version', 'note']);
+        if (bodyObj.subject && typeof bodyObj.subject === 'object' && !Array.isArray(bodyObj.subject)) {
+          unknown.push(...findUnknownFields(bodyObj.subject, ['run_id', 'sha'], 'subject'));
+        }
+        if (unknown.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Unknown fields', retryable: false, retry_after_s: null, request_id: requestId, details: { unknown_fields: unknown } } } };
+        }
         const row = getTaskRow(taskId);
         if (!row) return { status: 404, body: { error: { code: 'not_found', message: 'Task not found', retryable: false, retry_after_s: null, request_id: requestId } } };
         const task = JSON.parse(row.payload) as TaskRecord;
@@ -1255,40 +1371,93 @@ export function createApiServer(config: ServerConfig): ApiServer {
         }
         const subject = bodyObj.subject as { run_id?: unknown; sha?: unknown } | undefined;
         const decision = bodyObj.decision;
-        if (!subject || typeof subject.run_id !== 'string' || typeof subject.sha !== 'string' || !['accept', 'accept_with_notes', 'rework', 'reject'].includes(String(decision))) {
-          return { status: 400, body: { error: { code: 'invalid_request', message: 'Invalid subject or decision', retryable: false, retry_after_s: null, request_id: requestId } } };
+        if (
+          !subject ||
+          typeof subject !== 'object' ||
+          Array.isArray(subject) ||
+          typeof subject.run_id !== 'string' ||
+          typeof subject.sha !== 'string' ||
+          !/^[0-9a-f]{40}$/i.test(subject.sha) ||
+          !['accept', 'accept_with_notes', 'rework', 'reject'].includes(String(decision))
+        ) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Invalid subject or decision', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
         }
+        if (bodyObj.based_on !== undefined && (!Array.isArray(bodyObj.based_on) || bodyObj.based_on.some(b => typeof b !== 'string' || b.length < 1))) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'based_on must be an array of non-empty strings', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
+        }
+        if (bodyObj.note !== undefined && bodyObj.note !== null && typeof bodyObj.note !== 'string') {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'note must be a string or null', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
+        }
+        if (bodyObj.expected_branch_version !== undefined && (typeof bodyObj.expected_branch_version !== 'number' || !Number.isSafeInteger(bodyObj.expected_branch_version))) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'expected_branch_version must be an integer', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
+        }
+
         const subjectRunId = subject.run_id;
-        const runMeta = getRunMeta(subjectRunId);
-        if (!runMeta || runMeta.task_id !== task.id) {
-          return { status: 422, body: { error: { code: 'validation_failed', message: 'Subject run does not belong to this task', retryable: false, retry_after_s: null, request_id: requestId, violations: [{ rule: 'REF_UNKNOWN', kind: 'dependency', path: 'subject.run_id', message: 'Run not found in task' }] } } };
-        }
-        const branchVersion = runMeta.lineage?.version ?? 1;
-        if (bodyObj.expected_branch_version !== undefined && bodyObj.expected_branch_version !== branchVersion) {
-          return { status: 409, body: { error: { code: 'version_conflict', message: 'Branch version conflict', retryable: true, retry_after_s: null, request_id: requestId } } };
-        }
+        const subjectSha = subject.sha;
+        const basedOn = Array.isArray(bodyObj.based_on) ? (bodyObj.based_on as string[]) : [];
         const now = Date.now();
-        const ruling: RulingRecord = {
-          id: ulid('rul', now),
-          object: 'ruling',
-          task_id: task.id,
-          subject: { run_id: subjectRunId, sha: subject.sha },
-          branch: { id: runMeta.lineage?.branch_id ?? subjectRunId, version: branchVersion },
-          decision: decision as RulingRecord['decision'],
-          based_on: Array.isArray(bodyObj.based_on) ? (bodyObj.based_on as string[]) : [],
-          note: typeof bodyObj.note === 'string' ? bodyObj.note : null,
-          by: principal.principal,
-          at: new Date(now).toISOString(),
-          status: 'effective',
-          version: 1,
-        };
-        const respStr = JSON.stringify(ruling);
-        store.transaction(() => {
+
+        const txResult = store.transaction((): { status: number; body: unknown; committed: boolean } => {
+          const runMeta = getRunMeta(subjectRunId);
+          if (!runMeta || runMeta.task_id !== task.id) {
+            return { status: 422, body: { error: { code: 'validation_failed', message: 'Subject run does not belong to this task', retryable: false, retry_after_s: null, request_id: requestId, violations: [{ rule: 'REF_UNKNOWN', kind: 'dependency', path: 'subject.run_id', message: 'Run not found in task' }] } }, committed: false };
+          }
+          const subjectRun = store.get(subjectRunId);
+          if (!isTerminal(subjectRun.state)) {
+            return { status: 409, body: { error: { code: 'invalid_state', message: `Subject run in state ${subjectRun.state} is not terminal`, retryable: false, retry_after_s: null, request_id: requestId, details: { state: subjectRun.state } } }, committed: false };
+          }
+          const actualSha = subjectRun.preservation.sha ?? subjectRun.workspaceHead;
+          if ((actualSha !== null && subjectSha !== actualSha) || (actualSha === null && /^0{40}$/.test(subjectSha))) {
+            return { status: 422, body: { error: { code: 'validation_failed', message: 'Subject sha does not match run head_sha', retryable: false, retry_after_s: null, request_id: requestId, violations: [{ rule: 'SHA_MISMATCH', kind: 'review', path: 'subject.sha', message: `Expected ${actualSha ?? 'non-zero commit sha'}` }] } }, committed: false };
+          }
+
+          const existingRulings = store.db.prepare('SELECT id, payload FROM api_rulings WHERE task_id=?').all(task.id) as { id: string; payload: string }[];
+          const rulingIds = new Set(existingRulings.map(r => r.id));
+          for (const refId of basedOn) {
+            if (!task.run_ids.includes(refId) && !rulingIds.has(refId)) {
+              return { status: 422, body: { error: { code: 'validation_failed', message: `based_on reference '${refId}' not found in task`, retryable: false, retry_after_s: null, request_id: requestId, violations: [{ rule: 'REF_UNKNOWN', kind: 'dependency', path: 'based_on', message: `Unknown reference ${refId}` }] } }, committed: false };
+            }
+          }
+
+          const branchId = runMeta.lineage?.branch_id ?? subjectRunId;
+          const branchVersion = runMeta.lineage?.version ?? 1;
+          if (bodyObj.expected_branch_version !== undefined && bodyObj.expected_branch_version !== branchVersion) {
+            return { status: 409, body: { error: { code: 'version_conflict', message: 'Branch version conflict', retryable: true, retry_after_s: null, request_id: requestId } }, committed: false };
+          }
+
+          // Supersede any prior effective rulings on the same branch
+          for (const er of existingRulings) {
+            const prev = JSON.parse(er.payload) as RulingRecord;
+            if (prev.branch.id === branchId && prev.status === 'effective') {
+              prev.status = 'superseded';
+              prev.version++;
+              store.db.prepare('UPDATE api_rulings SET payload=? WHERE id=?').run(JSON.stringify(prev), prev.id);
+              store.emit('ruling.superseded', { ruling: prev, version: prev.version }, subjectRun, now);
+            }
+          }
+
+          const ruling: RulingRecord = {
+            id: ulid('rul', now),
+            object: 'ruling',
+            task_id: task.id,
+            subject: { run_id: subjectRunId, sha: subjectSha },
+            branch: { id: branchId, version: branchVersion },
+            decision: decision as RulingRecord['decision'],
+            based_on: basedOn,
+            note: typeof bodyObj.note === 'string' ? bodyObj.note : null,
+            by: principal.principal,
+            at: new Date(now).toISOString(),
+            status: 'effective',
+            version: 1,
+          };
+          const respStr = JSON.stringify(ruling);
           store.db.prepare('INSERT INTO api_rulings(id, task_id, project_id, payload, created_at) VALUES (?,?,?,?,?)').run(ruling.id, task.id, task.project_id, respStr, now);
-          store.emit('ruling.recorded', { ruling, version: ruling.version }, store.get(subjectRunId), now);
-          idempotency.completeInTransaction(scope, 201, respStr, now);
+          store.emit('ruling.recorded', { ruling, version: ruling.version }, subjectRun, now);
+          idempotency.completeInTransaction(scope, 201, respStr, now, task.project_id);
+          return { status: 201, body: respStr, committed: true };
         });
-        return { status: 201, body: respStr, alreadyCommittedInTx: true };
+
+        return { status: txResult.status, body: txResult.body, alreadyCommittedInTx: txResult.committed, projectId: task.project_id };
       });
       return;
     }
@@ -1320,20 +1489,19 @@ export function createApiServer(config: ServerConfig): ApiServer {
     if (method === 'POST' && taskJournalMatch) {
       if (!requireScope('control')) return;
       const taskId = taskJournalMatch[1]!;
-      const unknown = findUnknownFields(bodyObj, ['kind', 'data']);
-      if (unknown.length > 0) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
-        return;
-      }
       await withIdempotency(true, async scope => {
+        const unknown = findUnknownFields(bodyObj, ['kind', 'data']);
+        if (unknown.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Unknown fields', retryable: false, retry_after_s: null, request_id: requestId, details: { unknown_fields: unknown } } } };
+        }
         const row = getTaskRow(taskId);
         if (!row) return { status: 404, body: { error: { code: 'not_found', message: 'Task not found', retryable: false, retry_after_s: null, request_id: requestId } } };
         const task = JSON.parse(row.payload) as TaskRecord;
         if (!tokens.allowsProject(principal, task.project_id)) {
           return { status: 404, body: { error: { code: 'not_found', message: 'Task not found', retryable: false, retry_after_s: null, request_id: requestId } } };
         }
-        if (!['intervention', 'decision', 'anomaly', 'note'].includes(String(bodyObj.kind)) || !bodyObj.data || typeof bodyObj.data !== 'object') {
-          return { status: 400, body: { error: { code: 'invalid_request', message: 'Invalid journal kind or data', retryable: false, retry_after_s: null, request_id: requestId } } };
+        if (!['intervention', 'decision', 'anomaly', 'note'].includes(String(bodyObj.kind)) || !bodyObj.data || typeof bodyObj.data !== 'object' || Array.isArray(bodyObj.data)) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Invalid journal kind or data', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
         }
         const now = Date.now();
         const entry: JournalRecord = {
@@ -1347,10 +1515,10 @@ export function createApiServer(config: ServerConfig): ApiServer {
         const respStr = JSON.stringify(entry);
         store.transaction(() => {
           store.db.prepare('INSERT INTO api_journal(id, task_id, project_id, payload, created_at) VALUES (?,?,?,?,?)').run(entry.id, task.id, task.project_id, respStr, now);
-          store.emit('journal.appended', { entry }, null, now);
-          idempotency.completeInTransaction(scope, 201, respStr, now);
+          store.emit('journal.appended', { entry }, { projectId: task.project_id, taskId: task.id }, now);
+          idempotency.completeInTransaction(scope, 201, respStr, now, task.project_id);
         });
-        return { status: 201, body: respStr, alreadyCommittedInTx: true };
+        return { status: 201, body: respStr, alreadyCommittedInTx: true, projectId: task.project_id };
       });
       return;
     }
@@ -1432,10 +1600,22 @@ export function createApiServer(config: ServerConfig): ApiServer {
     if (method === 'PATCH' && runMatch) {
       if (!requireScope('control')) return;
       const runId = runMatch[1]!;
-      const allowedPatch = ['title', 'priority', 'critical', 'depends_on', 'runner', 'account', 'fallbacks', 'model', 'reasoning_effort', 'tier_rationale', 'budget', 'timeouts', 'degrade', 'waivers'];
-      const unknown = findUnknownFields(bodyObj, allowedPatch);
+      const unknown = findUnknownFields(bodyObj, PATCH_RUN_FIELDS);
+      if (Array.isArray(bodyObj.degrade)) {
+        bodyObj.degrade.forEach((d, idx) => {
+          unknown.push(...findUnknownFields(d, DEGRADE_FIELDS, `degrade[${idx}]`));
+        });
+      }
+      if (bodyObj.timeouts && typeof bodyObj.timeouts === 'object' && !Array.isArray(bodyObj.timeouts)) {
+        unknown.push(...findUnknownFields(bodyObj.timeouts, TIMEOUTS_FIELDS, 'timeouts'));
+      }
       if (unknown.length > 0) {
         sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
+        return;
+      }
+      const typeErrs = validateRunSpecTypes(bodyObj, '', true);
+      if (typeErrs.length > 0) {
+        sendError(res, { status: 400, code: 'invalid_request', message: typeErrs[0]!.message, requestId, details: { violations: typeErrs }, headers: respHeaders });
         return;
       }
       const oop = checkRunSpecPhase1(bodyObj, '');
@@ -1462,8 +1642,90 @@ export function createApiServer(config: ServerConfig): ApiServer {
         sendError(res, { status: 409, code: 'version_conflict', message: 'Run version mismatch', requestId, headers: respHeaders });
         return;
       }
-      if (bodyObj.title !== undefined) meta.title = String(bodyObj.title);
-      if (bodyObj.critical !== undefined) meta.critical = Boolean(bodyObj.critical);
+
+      const project = projectMap.get(meta.project_id)!;
+      const taskRow = getTaskRow(meta.task_id);
+      const taskLevel: Level = taskRow ? (JSON.parse(taskRow.payload) as TaskRecord).level : 'L2';
+      const candidateSpec: Record<string, unknown> = {
+        role: meta.role,
+        title: bodyObj.title ?? meta.title,
+        instructions: meta.instructions,
+        runner: bodyObj.runner ?? meta.placement.runner,
+        account: bodyObj.account !== undefined ? bodyObj.account : meta.placement.account_requested,
+        model: bodyObj.model ?? meta.model_record.requested,
+        reasoning_effort: bodyObj.reasoning_effort ?? meta.effort_record.requested,
+        tier_rationale: bodyObj.tier_rationale ?? meta.tier_rationale,
+        interaction: meta.interaction,
+        workspace: meta.workspace_mode,
+        read_only: meta.policy.read_only,
+        toolchain_write: meta.policy.toolchain_write,
+        degrade: bodyObj.degrade ?? meta.placement.degrade,
+        timeouts: bodyObj.timeouts
+          ? { ...run.timeouts, ...(bodyObj.timeouts as Record<string, unknown>) }
+          : run.timeouts,
+        critical: bodyObj.critical ?? meta.critical,
+      };
+      const check = validateRunSpec({
+        spec: candidateSpec,
+        pathPrefix: 'run',
+        taskLevel,
+        project,
+        runners: config.runners,
+      });
+      if (check.violations.length > 0) {
+        sendError(res, { status: 422, code: 'validation_failed', message: `${check.violations.length} validation error(s)`, requestId, violations: check.violations, headers: respHeaders });
+        return;
+      }
+
+      const resolved = check.resolved!;
+      const primary = resolved.candidates[0]!;
+      const readOnlyDegraded = primary.degraded.some(d => d.capability === 'read_only');
+
+      meta.title = String(candidateSpec.title);
+      meta.critical = Boolean(candidateSpec.critical);
+      meta.tier_rationale = String(candidateSpec.tier_rationale);
+      meta.placement = {
+        ...meta.placement,
+        runner: primary.runner,
+        account: primary.account,
+        account_requested: (candidateSpec.account as string | null | undefined) ?? null,
+        degrade: (candidateSpec.degrade as RunMetadata['placement']['degrade'] | undefined) ?? [],
+      };
+      meta.model_record = {
+        ...meta.model_record,
+        requested: String(candidateSpec.model),
+        resolved: primary.model,
+        tier: primary.tier,
+      };
+      meta.effort_record = {
+        ...meta.effort_record,
+        requested: String(candidateSpec.reasoning_effort),
+        resolved_native: primary.resolved_native,
+      };
+      meta.degraded = primary.degraded;
+      meta.policy = {
+        ...meta.policy,
+        forbidden: Object.keys(primary.forbidden_guarantee),
+        forbidden_guarantee: primary.forbidden_guarantee,
+      };
+
+      run.account = primary.account;
+      run.model = primary.model;
+      run.modelAliases = primary.aliases;
+      run.reasoningEffort = primary.reasoning_effort;
+      run.readOnly = resolved.read_only && !readOnlyDegraded;
+      run.forbidden = Object.entries(primary.forbidden_guarantee)
+        .filter(([, levels]) => levels.includes('enforced'))
+        .map(([act]) => act);
+      if (bodyObj.timeouts && typeof bodyObj.timeouts === 'object') {
+        const t = bodyObj.timeouts as Record<string, unknown>;
+        run.timeouts = {
+          total_s: t.total_s !== undefined ? (t.total_s as number | null) : run.timeouts.total_s,
+          idle_s: t.idle_s !== undefined ? (t.idle_s as number | null) : run.timeouts.idle_s,
+          waiting_s: t.waiting_s !== undefined ? (t.waiting_s as number | null) : run.timeouts.waiting_s,
+        };
+      }
+
       run.version++;
       const serialized = store.transaction(() => {
         store.put(run);
@@ -1480,28 +1742,40 @@ export function createApiServer(config: ServerConfig): ApiServer {
     if (method === 'POST' && runCancelMatch) {
       if (!requireScope('control')) return;
       const runId = runCancelMatch[1]!;
-      const unknown = findUnknownFields(bodyObj, ['reason', 'preserve_wip', 'cascade']);
-      if (unknown.length > 0) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
-        return;
-      }
-      if (bodyObj.cascade === true) {
-        sendError(res, { status: 501, code: 'not_implemented', message: 'cascade cancel is not implemented in Phase 1', requestId, details: { paths: ['cascade'], available_in: 'Phase 2' }, headers: respHeaders });
-        return;
-      }
-      await withIdempotency(false, async () => {
+      await withIdempotency(false, async scope => {
+        const unknown = findUnknownFields(bodyObj, ['reason', 'preserve_wip', 'cascade']);
+        if (unknown.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Unknown fields', retryable: false, retry_after_s: null, request_id: requestId, details: { unknown_fields: unknown } } } };
+        }
+        if (bodyObj.cascade !== undefined && typeof bodyObj.cascade !== 'boolean') {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'cascade must be a boolean', retryable: false, retry_after_s: null, request_id: requestId } } };
+        }
+        if (bodyObj.preserve_wip !== undefined && typeof bodyObj.preserve_wip !== 'boolean') {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'preserve_wip must be a boolean', retryable: false, retry_after_s: null, request_id: requestId } } };
+        }
+        if (bodyObj.cascade === true) {
+          return { status: 501, body: { error: { code: 'not_implemented', message: 'cascade cancel is not implemented in Phase 1', retryable: false, retry_after_s: null, request_id: requestId, details: { paths: ['cascade'], available_in: 'Phase 2' } } } };
+        }
         const meta = getRunMeta(runId);
         if (!meta || !tokens.allowsProject(principal, meta.project_id)) {
           return { status: 404, body: { error: { code: 'not_found', message: 'Run not found', retryable: false, retry_after_s: null, request_id: requestId } } };
         }
         const reason = bodyObj.reason;
         if (typeof reason !== 'string' || reason.length < 1 || reason.length > 200) {
-          return { status: 400, body: { error: { code: 'invalid_request', message: 'reason must be 1..200 chars', retryable: false, retry_after_s: null, request_id: requestId } } };
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'reason must be 1..200 chars', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: meta.project_id };
         }
         const run = store.get(runId);
         const wasRunningOrWaiting = ['running', 'waiting'].includes(run.state);
+        const status = wasRunningOrWaiting ? 202 : 200;
+        const now = Date.now();
         try {
-          runtime.stop(runId, 'cancel', Date.now(), Boolean(bodyObj.preserve_wip ?? false), reason);
+          const respStr = store.transaction(() => {
+            const updated = runtime.stopInTransaction(runId, 'cancel', now, Boolean(bodyObj.preserve_wip ?? false), reason);
+            const jsonStr = JSON.stringify(serializeRun(updated, meta, getReleaseState(store, runId)));
+            idempotency.completeInTransaction(scope, status, jsonStr, now, meta.project_id);
+            return jsonStr;
+          });
+          return { status, body: respStr, alreadyCommittedInTx: true, projectId: meta.project_id };
         } catch (err) {
           if (err instanceof InvalidState) {
             return {
@@ -1516,15 +1790,11 @@ export function createApiServer(config: ServerConfig): ApiServer {
                   details: { state: run.state, phase: err.phase, allowed: allowedOpsForState(run.state) },
                 },
               },
+              projectId: meta.project_id,
             };
           }
           throw err;
         }
-        const updated = store.get(runId);
-        return {
-          status: wasRunningOrWaiting ? 202 : 200,
-          body: serializeRun(updated, meta, getReleaseState(store, runId)),
-        };
       });
       return;
     }
@@ -1534,24 +1804,31 @@ export function createApiServer(config: ServerConfig): ApiServer {
     if (method === 'POST' && runPauseMatch) {
       if (!requireScope('control')) return;
       const runId = runPauseMatch[1]!;
-      const unknown = findUnknownFields(bodyObj, ['reason']);
-      if (unknown.length > 0) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
-        return;
-      }
-      await withIdempotency(false, async () => {
+      await withIdempotency(false, async scope => {
+        const unknown = findUnknownFields(bodyObj, ['reason']);
+        if (unknown.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Unknown fields', retryable: false, retry_after_s: null, request_id: requestId, details: { unknown_fields: unknown } } } };
+        }
         const meta = getRunMeta(runId);
         if (!meta || !tokens.allowsProject(principal, meta.project_id)) {
           return { status: 404, body: { error: { code: 'not_found', message: 'Run not found', retryable: false, retry_after_s: null, request_id: requestId } } };
         }
         const reason = bodyObj.reason;
         if (typeof reason !== 'string' || reason.length < 1 || reason.length > 200) {
-          return { status: 400, body: { error: { code: 'invalid_request', message: 'reason must be 1..200 chars', retryable: false, retry_after_s: null, request_id: requestId } } };
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'reason must be 1..200 chars', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: meta.project_id };
         }
         const run = store.get(runId);
         const wasRunningOrWaiting = ['running', 'waiting'].includes(run.state);
+        const status = wasRunningOrWaiting ? 202 : 200;
+        const now = Date.now();
         try {
-          runtime.stop(runId, 'pause', Date.now(), true, reason);
+          const respStr = store.transaction(() => {
+            const updated = runtime.stopInTransaction(runId, 'pause', now, true, reason);
+            const jsonStr = JSON.stringify(serializeRun(updated, meta, getReleaseState(store, runId)));
+            idempotency.completeInTransaction(scope, status, jsonStr, now, meta.project_id);
+            return jsonStr;
+          });
+          return { status, body: respStr, alreadyCommittedInTx: true, projectId: meta.project_id };
         } catch (err) {
           if (err instanceof InvalidState) {
             return {
@@ -1566,15 +1843,11 @@ export function createApiServer(config: ServerConfig): ApiServer {
                   details: { state: run.state, phase: err.phase, allowed: allowedOpsForState(run.state) },
                 },
               },
+              projectId: meta.project_id,
             };
           }
           throw err;
         }
-        const updated = store.get(runId);
-        return {
-          status: wasRunningOrWaiting ? 202 : 200,
-          body: serializeRun(updated, meta, getReleaseState(store, runId)),
-        };
       });
       return;
     }
@@ -1584,12 +1857,11 @@ export function createApiServer(config: ServerConfig): ApiServer {
     if (method === 'POST' && runMsgMatch) {
       if (!requireScope('control')) return;
       const runId = runMsgMatch[1]!;
-      const unknown = findUnknownFields(bodyObj, ['text', 'kind']);
-      if (unknown.length > 0) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
-        return;
-      }
-      await withIdempotency(true, async () => {
+      await withIdempotency(true, async scope => {
+        const unknown = findUnknownFields(bodyObj, ['text', 'kind']);
+        if (unknown.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Unknown fields', retryable: false, retry_after_s: null, request_id: requestId, details: { unknown_fields: unknown } } } };
+        }
         const meta = getRunMeta(runId);
         if (!meta || !tokens.allowsProject(principal, meta.project_id)) {
           return { status: 404, body: { error: { code: 'not_found', message: 'Run not found', retryable: false, retry_after_s: null, request_id: requestId } } };
@@ -1597,7 +1869,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
         const text = bodyObj.text;
         const kind = bodyObj.kind ?? 'answer';
         if (typeof text !== 'string' || text.length < 1 || Buffer.byteLength(text) > 64 * 1024 || !['answer', 'instruction'].includes(String(kind))) {
-          return { status: 400, body: { error: { code: 'invalid_request', message: 'Invalid message text or kind', retryable: false, retry_after_s: null, request_id: requestId } } };
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Invalid message text or kind', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: meta.project_id };
         }
         const run = store.get(runId);
         if (run.messages.some(m => m.state === 'pending')) {
@@ -1613,11 +1885,17 @@ export function createApiServer(config: ServerConfig): ApiServer {
                 details: { state: run.state, reason: 'message_pending' },
               },
             },
+            projectId: meta.project_id,
           };
         }
         const messageId = `msg_${randomUUID()}`;
+        const now = Date.now();
+        const respStr = JSON.stringify({ message_id: messageId, accepted_at: new Date(now).toISOString(), delivery: 'pending' });
         try {
-          runtime.message(runId, messageId, text);
+          store.transaction(() => {
+            runtime.messageInTransaction(runId, messageId, text);
+            idempotency.completeInTransaction(scope, 202, respStr, now, meta.project_id);
+          });
         } catch (err) {
           const msg = err instanceof Error ? err.message : '';
           if (msg === 'invalid_message_state') {
@@ -1633,13 +1911,16 @@ export function createApiServer(config: ServerConfig): ApiServer {
                   details: { state: run.state, allowed: allowedOpsForState(run.state) },
                 },
               },
+              projectId: meta.project_id,
             };
           }
           throw err;
         }
         return {
           status: 202,
-          body: { message_id: messageId, accepted_at: new Date().toISOString(), delivery: 'pending' },
+          body: respStr,
+          alreadyCommittedInTx: true,
+          projectId: meta.project_id,
         };
       });
       return;
@@ -1650,19 +1931,31 @@ export function createApiServer(config: ServerConfig): ApiServer {
     if (method === 'POST' && runCompleteMatch) {
       if (!requireScope('control')) return;
       const runId = runCompleteMatch[1]!;
-      const unknown = findUnknownFields(bodyObj, ['note']);
-      if (unknown.length > 0) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
-        return;
-      }
-      await withIdempotency(false, async () => {
+      await withIdempotency(false, async scope => {
+        const unknown = findUnknownFields(bodyObj, ['note']);
+        if (unknown.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Unknown fields', retryable: false, retry_after_s: null, request_id: requestId, details: { unknown_fields: unknown } } } };
+        }
+        if (bodyObj.note !== undefined && bodyObj.note !== null && typeof bodyObj.note !== 'string') {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'note must be a string or null', retryable: false, retry_after_s: null, request_id: requestId } } };
+        }
         const meta = getRunMeta(runId);
         if (!meta || !tokens.allowsProject(principal, meta.project_id)) {
           return { status: 404, body: { error: { code: 'not_found', message: 'Run not found', retryable: false, retry_after_s: null, request_id: requestId } } };
         }
         const run = store.get(runId);
+        const now = Date.now();
+        let committedRun: Run;
+        let respStr: string;
         try {
-          runtime.complete(runId);
+          const out = store.transaction(() => {
+            const updated = runtime.completeInTransaction(runId);
+            const jsonStr = JSON.stringify(serializeRun(updated, meta, getReleaseState(store, runId)));
+            idempotency.completeInTransaction(scope, 202, jsonStr, now, meta.project_id);
+            return { updated, jsonStr };
+          });
+          committedRun = out.updated;
+          respStr = out.jsonStr;
         } catch (err) {
           if (err instanceof Error && err.message === 'invalid_complete_state') {
             return {
@@ -1677,12 +1970,13 @@ export function createApiServer(config: ServerConfig): ApiServer {
                   details: { state: run.state, allowed: allowedOpsForState(run.state) },
                 },
               },
+              projectId: meta.project_id,
             };
           }
           throw err;
         }
-        const updated = store.get(runId);
-        return { status: 202, body: serializeRun(updated, meta, getReleaseState(store, runId)) };
+        if (committedRun.inputMode === 'stdin') runtime.flushPendingCommands(committedRun);
+        return { status: 202, body: respStr, alreadyCommittedInTx: true, projectId: meta.project_id };
       });
       return;
     }
@@ -1692,20 +1986,53 @@ export function createApiServer(config: ServerConfig): ApiServer {
     if (method === 'POST' && runContinueMatch) {
       if (!requireScope('submit')) return;
       const runId = runContinueMatch[1]!;
-      const unknown = findUnknownFields(bodyObj, ['mode', 'verdicts', 'ruling_id', 'notes', 'overrides', 'rehome_dependents', 'source_version']);
-      if (unknown.length > 0) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
-        return;
-      }
-      if (bodyObj.verdicts !== undefined || bodyObj.ruling_id !== undefined) {
-        const paths: string[] = [];
-        if (bodyObj.verdicts !== undefined) paths.push('verdicts');
-        if (bodyObj.ruling_id !== undefined) paths.push('ruling_id');
-        sendError(res, { status: 501, code: 'not_implemented', message: 'verdicts/ruling_id on continue is not implemented in Phase 1', requestId, details: { paths, available_in: 'Phase 4' }, headers: respHeaders });
-        return;
-      }
-
       await withIdempotency(true, async scope => {
+        const unknown = findUnknownFields(bodyObj, CONTINUE_FIELDS);
+        if (bodyObj.overrides !== undefined) {
+          if (!bodyObj.overrides || typeof bodyObj.overrides !== 'object' || Array.isArray(bodyObj.overrides)) {
+            return { status: 400, body: { error: { code: 'invalid_request', message: 'overrides must be an object', retryable: false, retry_after_s: null, request_id: requestId } } };
+          }
+          const ov = bodyObj.overrides as Record<string, unknown>;
+          unknown.push(...findUnknownFields(ov, OVERRIDES_FIELDS, 'overrides'));
+          if (Array.isArray(ov.degrade)) {
+            ov.degrade.forEach((d, idx) => unknown.push(...findUnknownFields(d, DEGRADE_FIELDS, `overrides.degrade[${idx}]`)));
+          }
+          if (ov.timeouts && typeof ov.timeouts === 'object' && !Array.isArray(ov.timeouts)) {
+            unknown.push(...findUnknownFields(ov.timeouts, TIMEOUTS_FIELDS, 'overrides.timeouts'));
+          }
+        }
+        if (unknown.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Unknown fields', retryable: false, retry_after_s: null, request_id: requestId, details: { unknown_fields: unknown } } } };
+        }
+        if (bodyObj.notes !== undefined && typeof bodyObj.notes !== 'string') {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'notes must be a string', retryable: false, retry_after_s: null, request_id: requestId } } };
+        }
+        if (bodyObj.rehome_dependents !== undefined && typeof bodyObj.rehome_dependents !== 'boolean') {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'rehome_dependents must be a boolean', retryable: false, retry_after_s: null, request_id: requestId } } };
+        }
+        if (bodyObj.source_version !== undefined && (typeof bodyObj.source_version !== 'number' || !Number.isSafeInteger(bodyObj.source_version))) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'source_version must be an integer', retryable: false, retry_after_s: null, request_id: requestId } } };
+        }
+        const overrides = (bodyObj.overrides as Record<string, unknown> | undefined) ?? {};
+        const ovTypeErrs = validateRunSpecTypes(overrides, 'overrides', true);
+        if (overrides.instructions_append !== undefined && typeof overrides.instructions_append !== 'string') {
+          ovTypeErrs.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: 'overrides.instructions_append', message: 'instructions_append must be a string' });
+        }
+        if (ovTypeErrs.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: ovTypeErrs[0]!.message, retryable: false, retry_after_s: null, request_id: requestId, details: { violations: ovTypeErrs } } } };
+        }
+        if (bodyObj.verdicts !== undefined || bodyObj.ruling_id !== undefined || bodyObj.rehome_dependents === true) {
+          const paths: string[] = [];
+          if (bodyObj.verdicts !== undefined) paths.push('verdicts');
+          if (bodyObj.ruling_id !== undefined) paths.push('ruling_id');
+          if (bodyObj.rehome_dependents === true) paths.push('rehome_dependents');
+          return { status: 501, body: { error: { code: 'not_implemented', message: 'verdicts/ruling_id/rehome_dependents on continue is not implemented in Phase 1', retryable: false, retry_after_s: null, request_id: requestId, details: { paths, available_in: 'Phase 4' } } } };
+        }
+        const ovOop = checkRunSpecPhase1(overrides, 'overrides');
+        if (ovOop) {
+          return { status: 501, body: { error: { code: 'not_implemented', message: 'continue.overrides contains fields not implemented in Phase 1', retryable: false, retry_after_s: null, request_id: requestId, details: { paths: ovOop.paths, available_in: ovOop.availableIn } } } };
+        }
+
         const meta = getRunMeta(runId);
         if (!meta || !tokens.allowsProject(principal, meta.project_id)) {
           return { status: 404, body: { error: { code: 'not_found', message: 'Run not found', retryable: false, retry_after_s: null, request_id: requestId } } };
@@ -1713,12 +2040,12 @@ export function createApiServer(config: ServerConfig): ApiServer {
         const taskRow = getTaskRow(meta.task_id);
         const task = JSON.parse(taskRow!.payload) as TaskRecord;
         if (task.state !== 'open') {
-          return { status: 409, body: { error: { code: 'invalid_state', message: `Task is ${task.state}`, retryable: false, retry_after_s: null, request_id: requestId, details: { task_state: task.state } } } };
+          return { status: 409, body: { error: { code: 'invalid_state', message: `Task is ${task.state}`, retryable: false, retry_after_s: null, request_id: requestId, details: { task_state: task.state } } }, projectId: meta.project_id };
         }
         const source = store.get(runId);
         const mode = bodyObj.mode;
         if (!['resume', 'takeover', 'rework'].includes(String(mode))) {
-          return { status: 400, body: { error: { code: 'invalid_request', message: 'mode must be resume, takeover, or rework', retryable: false, retry_after_s: null, request_id: requestId } } };
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'mode must be resume, takeover, or rework', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: meta.project_id };
         }
         const allowedModes: Record<string, string[]> = {
           paused: ['resume'],
@@ -1727,21 +2054,23 @@ export function createApiServer(config: ServerConfig): ApiServer {
           done: ['rework'],
         };
         if (!(allowedModes[source.state] ?? []).includes(String(mode))) {
-          return { status: 409, body: { error: { code: 'invalid_state', message: `Cannot continue (${String(mode)}) run in state ${source.state}`, retryable: false, retry_after_s: null, request_id: requestId, details: { state: source.state, allowed: allowedOpsForState(source.state) } } } };
+          return { status: 409, body: { error: { code: 'invalid_state', message: `Cannot continue (${String(mode)}) run in state ${source.state}`, retryable: false, retry_after_s: null, request_id: requestId, details: { state: source.state, allowed: allowedOpsForState(source.state) } } }, projectId: meta.project_id };
         }
         if ((mode === 'resume' || mode === 'takeover') && source.preservation.state === 'failed') {
-          return { status: 409, body: { error: { code: 'preservation_failed', message: 'Source run preservation failed; cannot resume or takeover', retryable: false, retry_after_s: null, request_id: requestId } } };
+          return { status: 409, body: { error: { code: 'preservation_failed', message: 'Source run preservation failed; cannot resume or takeover', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: meta.project_id };
         }
         if (bodyObj.source_version !== undefined && bodyObj.source_version !== source.version) {
-          return { status: 409, body: { error: { code: 'version_conflict', message: 'Source run version mismatch', retryable: true, retry_after_s: null, request_id: requestId } } };
+          return { status: 409, body: { error: { code: 'version_conflict', message: 'Source run version mismatch', retryable: true, retry_after_s: null, request_id: requestId } }, projectId: meta.project_id };
         }
 
         const project = projectMap.get(meta.project_id)!;
-        const overrides = (bodyObj.overrides as Record<string, unknown> | undefined) ?? {};
+        const baseSha = source.preservation.sha ?? source.workspaceHead ?? meta.base.sha;
+        const notesSuffix = typeof bodyObj.notes === 'string' && bodyObj.notes.length > 0 ? `\n\n[Continue Notes]\n${bodyObj.notes}` : '';
+        const appendSuffix = typeof overrides.instructions_append === 'string' && overrides.instructions_append.length > 0 ? `\n\n${overrides.instructions_append}` : '';
         const newSpec: Record<string, unknown> = {
           role: meta.role,
           title: meta.title,
-          instructions: meta.instructions + (typeof overrides.instructions_append === 'string' ? `\n\n${overrides.instructions_append}` : ''),
+          instructions: `${meta.instructions}${notesSuffix}${appendSuffix}`,
           runner: overrides.runner ?? meta.placement.runner,
           account: overrides.account !== undefined ? overrides.account : meta.placement.account_requested,
           model: overrides.model ?? meta.model_record.requested,
@@ -1750,24 +2079,29 @@ export function createApiServer(config: ServerConfig): ApiServer {
           interaction: overrides.interaction ?? meta.interaction,
           workspace: meta.workspace_mode,
           read_only: meta.policy.read_only,
+          toolchain_write: meta.policy.toolchain_write,
+          base: baseSha ? { kind: 'commit', sha: baseSha } : meta.base,
+          timeouts: overrides.timeouts
+            ? { ...source.timeouts, ...(overrides.timeouts as Record<string, unknown>) }
+            : source.timeouts,
           degrade: overrides.degrade ?? meta.placement.degrade,
         };
         const check = validateRunSpec({ spec: newSpec, pathPrefix: 'overrides', taskLevel: task.level, project, runners: config.runners });
         if (check.violations.length > 0) {
-          return { status: 422, body: { error: { code: 'validation_failed', message: 'Validation failed on continue', retryable: false, retry_after_s: null, request_id: requestId, violations: check.violations } } };
+          return { status: 422, body: { error: { code: 'validation_failed', message: 'Validation failed on continue', retryable: false, retry_after_s: null, request_id: requestId, violations: check.violations } }, projectId: meta.project_id };
         }
 
         const now = Date.now();
         const newRunId = ulid('run', now);
-        const baseSha = source.preservation.sha ?? source.workspaceHead ?? meta.base.sha;
         const isFork = meta.continued_by.length > 0;
         const lineage: RunMetadata['lineage'] = isFork
           ? { branch_id: newRunId, forked_from: source.id, candidate: null, version: 1 }
-          : (meta.lineage ? { ...meta.lineage } : { branch_id: source.id, forked_from: null, candidate: null, version: 1 });
+          : (meta.lineage ? { ...meta.lineage, version: meta.lineage.version + 1 } : { branch_id: source.id, forked_from: null, candidate: null, version: 1 });
 
         const built = buildRunFromSpec({
           runId: newRunId,
           taskId: task.id,
+          taskLevel: task.level,
           project,
           spec: newSpec,
           principal,
@@ -1796,6 +2130,19 @@ export function createApiServer(config: ServerConfig): ApiServer {
             store.put(source);
             stateEvent(store, source, from, now);
           }
+          // Supersede any effective rulings on this branch when branch advances without fork
+          if (!isFork && meta.lineage) {
+            const existingRulings = store.db.prepare('SELECT payload FROM api_rulings WHERE task_id=?').all(task.id) as { payload: string }[];
+            for (const er of existingRulings) {
+              const prev = JSON.parse(er.payload) as RulingRecord;
+              if (prev.branch.id === meta.lineage.branch_id && prev.status === 'effective') {
+                prev.status = 'superseded';
+                prev.version++;
+                store.db.prepare('UPDATE api_rulings SET payload=? WHERE id=?').run(JSON.stringify(prev), prev.id);
+                store.emit('ruling.superseded', { ruling: prev, version: prev.version }, source, now);
+              }
+            }
+          }
           store.db.prepare('UPDATE api_runs SET payload=? WHERE id=?').run(JSON.stringify(meta), source.id);
           store.db.prepare('UPDATE api_tasks SET payload=? WHERE id=?').run(JSON.stringify(task), task.id);
           store.put(built.run);
@@ -1804,10 +2151,10 @@ export function createApiServer(config: ServerConfig): ApiServer {
             .run(built.run.id, task.id, project.id, null, sha256Hex(canonicalJson(newSpec)), JSON.stringify(built.meta), now);
           store.emit('run.created', { run: serializedNew, version: built.run.version }, built.run, now);
           stateEvent(store, built.run, null, now);
-          idempotency.completeInTransaction(scope, 201, respStr, now);
+          idempotency.completeInTransaction(scope, 201, respStr, now, project.id);
         });
 
-        return { status: 201, body: respStr, alreadyCommittedInTx: true };
+        return { status: 201, body: respStr, alreadyCommittedInTx: true, projectId: project.id };
       });
       return;
     }
@@ -1817,16 +2164,18 @@ export function createApiServer(config: ServerConfig): ApiServer {
     if (method === 'POST' && runReleaseMatch) {
       if (!requireScope('decide')) return;
       const runId = runReleaseMatch[1]!;
-      const unknown = findUnknownFields(bodyObj, ['preservation', 'note']);
-      if (bodyObj.preservation && typeof bodyObj.preservation === 'object' && !Array.isArray(bodyObj.preservation)) {
-        unknown.push(...findUnknownFields(bodyObj.preservation, ['kind', 'ref', 'ack'], 'preservation'));
-      }
-      if (unknown.length > 0) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Unknown fields', requestId, details: { unknown_fields: unknown }, headers: respHeaders });
-        return;
-      }
 
       await withIdempotency(false, async scope => {
+        const unknown = findUnknownFields(bodyObj, ['preservation', 'note']);
+        if (bodyObj.preservation && typeof bodyObj.preservation === 'object' && !Array.isArray(bodyObj.preservation)) {
+          unknown.push(...findUnknownFields(bodyObj.preservation, ['kind', 'ref', 'ack'], 'preservation'));
+        }
+        if (unknown.length > 0) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'Unknown fields', retryable: false, retry_after_s: null, request_id: requestId, details: { unknown_fields: unknown } } } };
+        }
+        if (bodyObj.note !== undefined && bodyObj.note !== null && typeof bodyObj.note !== 'string') {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'note must be a string or null', retryable: false, retry_after_s: null, request_id: requestId } } };
+        }
         const meta = getRunMeta(runId);
         if (!meta || !tokens.allowsProject(principal, meta.project_id)) {
           return { status: 404, body: { error: { code: 'not_found', message: 'Run not found', retryable: false, retry_after_s: null, request_id: requestId } } };
@@ -1845,6 +2194,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
                 details: { state: run.state, allowed: allowedOpsForState(run.state) },
               },
             },
+            projectId: meta.project_id,
           };
         }
         const existingRelease = getReleaseState(store, runId);
@@ -1861,11 +2211,12 @@ export function createApiServer(config: ServerConfig): ApiServer {
                 details: { state: run.state, reason: 'already_released' },
               },
             },
+            projectId: meta.project_id,
           };
         }
         const preservation = bodyObj.preservation;
         if (!preservation || typeof preservation !== 'object' || Array.isArray(preservation)) {
-          return { status: 400, body: { error: { code: 'invalid_request', message: 'preservation object is required', retryable: false, retry_after_s: null, request_id: requestId } } };
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'preservation object is required', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: meta.project_id };
         }
 
         const project = projectMap.get(meta.project_id)!;
@@ -1889,6 +2240,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
                 details: { reason: verified.reason },
               },
             },
+            projectId: meta.project_id,
           };
         }
 
@@ -1901,18 +2253,31 @@ export function createApiServer(config: ServerConfig): ApiServer {
         };
         const respStr = JSON.stringify({ release: pendingRelease, verified: verified.verified });
         store.transaction(() => {
-          saveReleaseState(store, run.id, pendingRelease, now);
-          idempotency.completeInTransaction(scope, 200, respStr, now);
+          saveReleaseRecord(
+            store,
+            run.id,
+            {
+              release: pendingRelease,
+              verified: verified.verified,
+              progress: { ref_tx_done: false, dir_removed: false },
+            },
+            now,
+          );
+          idempotency.completeInTransaction(scope, 200, respStr, now, meta.project_id);
         });
 
-        await executeWorktreeRelease({
-          store,
-          repoRoot: resolve(project.workspace_path),
-          run,
-          verified: verified.verified,
-        });
+        try {
+          await executeWorktreeRelease({
+            store,
+            repoRoot: resolve(project.workspace_path),
+            run,
+            verified: verified.verified,
+          });
+        } catch {
+          // Intent is committed; failures are reflected in persisted release state & recovery, never 5xx.
+        }
 
-        return { status: 200, body: respStr, alreadyCommittedInTx: true };
+        return { status: 200, body: respStr, alreadyCommittedInTx: true, projectId: meta.project_id };
       });
       return;
     }
@@ -1938,7 +2303,8 @@ export function createApiServer(config: ServerConfig): ApiServer {
 
   return {
     server,
-    listen(port = config.port ?? 0, host = config.host ?? '127.0.0.1') {
+    async listen(port = config.port ?? 0, host = config.host ?? '127.0.0.1') {
+      await recoverWorktreeReleases({ store, projectMap });
       return new Promise((resolvePromise, rejectPromise) => {
         server.once('error', rejectPromise);
         server.listen(port, host, () => {

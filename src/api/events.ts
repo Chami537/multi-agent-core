@@ -4,6 +4,12 @@ import type { AuthPrincipal } from './auth.js';
 import { sendError, sendJson } from './protocol.js';
 
 const DEFAULT_EXCLUDED_TYPES = new Set(['run.activity', 'journal.appended']);
+const INSTANCE_LEVEL_EVENTS = new Set([
+  'instance.started',
+  'capabilities.updated',
+  'runner.health_changed',
+  'account.status_changed',
+]);
 
 function matchesTypes(type: string, filterTypes: string[] | null): boolean {
   if (!filterTypes) return !DEFAULT_EXCLUDED_TYPES.has(type);
@@ -26,7 +32,9 @@ function matchesEvent(
   runs: string[],
   filterTypes: string[] | null,
 ): boolean {
-  if (ev.project_id !== null && !principal.projects.includes('*') && !principal.projects.includes(ev.project_id)) {
+  if (ev.project_id === null) {
+    if (!INSTANCE_LEVEL_EVENTS.has(ev.type)) return false;
+  } else if (!principal.projects.includes('*') && !principal.projects.includes(ev.project_id)) {
     return false;
   }
   if (projects.length > 0 && (ev.project_id === null || !projects.includes(ev.project_id))) return false;
@@ -161,6 +169,21 @@ export function handleEventsEndpoint(params: {
 
   let cursorSeq = since !== null ? since : meta.high;
   let closed = false;
+  let pollTimer: NodeJS.Timeout | null = null;
+  let keepaliveTimer: NodeJS.Timeout | null = null;
+
+  const cleanup = () => {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+    if (keepaliveTimer) {
+      clearInterval(keepaliveTimer);
+      keepaliveTimer = null;
+    }
+    if (closed) return;
+    closed = true;
+  };
 
   const flushNewEvents = () => {
     if (closed) return;
@@ -178,7 +201,7 @@ export function handleEventsEndpoint(params: {
             },
           };
           res.write(`event: stream.reset\ndata: ${JSON.stringify(resetFrame)}\n\n`);
-          closed = true;
+          cleanup();
           res.end();
           return;
         }
@@ -197,18 +220,12 @@ export function handleEventsEndpoint(params: {
   };
 
   flushNewEvents();
+  if (closed) return;
 
-  const pollTimer = setInterval(flushNewEvents, params.pollMs ?? 30);
-  const keepaliveTimer = setInterval(() => {
+  pollTimer = setInterval(flushNewEvents, params.pollMs ?? 30);
+  keepaliveTimer = setInterval(() => {
     if (!closed) res.write(': keepalive\n\n');
   }, params.keepaliveMs ?? 15_000);
-
-  const cleanup = () => {
-    if (closed) return;
-    closed = true;
-    clearInterval(pollTimer);
-    clearInterval(keepaliveTimer);
-  };
 
   req.on('close', cleanup);
   res.on('close', cleanup);

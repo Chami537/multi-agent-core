@@ -39,6 +39,18 @@ export const DEGRADE_FIELDS = ['capability', 'mode', 'reason'] as const;
 export const BASE_FIELDS = ['kind', 'ref', 'sha', 'run_id'] as const;
 export const TIMEOUTS_FIELDS = ['total_s', 'idle_s', 'waiting_s'] as const;
 export const CONTEXT_FIELDS = ['notes'] as const;
+export const PATCH_RUN_FIELDS = [
+  'title', 'priority', 'critical', 'depends_on', 'runner', 'account', 'fallbacks',
+  'model', 'reasoning_effort', 'tier_rationale', 'budget', 'timeouts', 'degrade', 'waivers',
+] as const;
+export const CONTINUE_FIELDS = [
+  'mode', 'verdicts', 'ruling_id', 'notes', 'overrides', 'rehome_dependents', 'source_version',
+] as const;
+export const OVERRIDES_FIELDS = [
+  'runner', 'account', 'model', 'reasoning_effort', 'tier_rationale', 'interaction',
+  'instructions_append', 'degrade', 'timeouts', 'budget', 'fallbacks', 'depends_on',
+  'waivers', 'priority', 'critical',
+] as const;
 
 export function collectTaskCreateUnknownFields(body: Record<string, unknown>): string[] {
   const unknown = findUnknownFields(body, TASK_CREATE_FIELDS);
@@ -69,6 +81,116 @@ export function collectRunSpecUnknownFields(spec: Record<string, unknown>, prefi
     unknown.push(...findUnknownFields(spec.context, CONTEXT_FIELDS, `${prefix}.context`));
   }
   return unknown;
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
+}
+
+export function validateRunSpecTypes(spec: Record<string, unknown>, prefix: string, isPatch = false): Violation[] {
+  const v: Violation[] = [];
+  const p = (f: string) => (prefix ? `${prefix}.${f}` : f);
+
+  if (spec.client_ref !== undefined && spec.client_ref !== null) {
+    if (typeof spec.client_ref !== 'string' || spec.client_ref.length < 1 || spec.client_ref.length > 128) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('client_ref'), message: 'client_ref must be 1..128 chars' });
+    }
+  }
+  if (spec.ref !== undefined && spec.ref !== null) {
+    if (typeof spec.ref !== 'string' || spec.ref.length < 1 || spec.ref.length > 128) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('ref'), message: 'ref must be 1..128 chars' });
+    }
+  }
+  if (spec.critical !== undefined && typeof spec.critical !== 'boolean') {
+    v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('critical'), message: 'critical must be a boolean' });
+  }
+  if (spec.priority !== undefined) {
+    if (typeof spec.priority !== 'number' || !Number.isSafeInteger(spec.priority) || spec.priority < 0 || spec.priority > 100) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('priority'), message: 'priority must be an integer 0..100' });
+    }
+  }
+  if (spec.read_only !== undefined && typeof spec.read_only !== 'boolean') {
+    v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('read_only'), message: 'read_only must be a boolean' });
+  }
+  if (spec.toolchain_write !== undefined && typeof spec.toolchain_write !== 'boolean') {
+    v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('toolchain_write'), message: 'toolchain_write must be a boolean' });
+  }
+  if (spec.depends_on !== undefined) {
+    if (!Array.isArray(spec.depends_on) || spec.depends_on.some(d => typeof d !== 'string' || d.length < 1)) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('depends_on'), message: 'depends_on must be an array of non-empty strings' });
+    }
+  }
+  if (spec.fallbacks !== undefined) {
+    if (!Array.isArray(spec.fallbacks) || spec.fallbacks.some(f => !isPlainObject(f))) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('fallbacks'), message: 'fallbacks must be an array of objects' });
+    }
+  }
+  if (spec.waivers !== undefined) {
+    if (!Array.isArray(spec.waivers) || spec.waivers.some(w => typeof w !== 'string' && !isPlainObject(w))) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('waivers'), message: 'waivers must be an array of strings or objects' });
+    }
+  }
+  if (spec.on_interrupt !== undefined && !['notify', 'auto_continue'].includes(String(spec.on_interrupt))) {
+    v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('on_interrupt'), message: 'on_interrupt must be notify or auto_continue' });
+  }
+  if (spec.timeouts !== undefined) {
+    if (!isPlainObject(spec.timeouts)) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('timeouts'), message: 'timeouts must be an object' });
+    } else {
+      for (const k of TIMEOUTS_FIELDS) {
+        const val = spec.timeouts[k];
+        if (val !== undefined && val !== null && (typeof val !== 'number' || !Number.isFinite(val) || val < 0)) {
+          v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p(`timeouts.${k}`), message: `timeouts.${k} must be null or a non-negative number` });
+        }
+      }
+    }
+  }
+  if (spec.base !== undefined) {
+    if (!isPlainObject(spec.base)) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('base'), message: 'base must be an object' });
+    } else if (typeof spec.base.kind !== 'string' || !['branch', 'commit', 'wip', 'run'].includes(spec.base.kind)) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('base.kind'), message: 'base.kind must be branch, commit, wip, or run' });
+    }
+  }
+  if (spec.context !== undefined) {
+    if (!isPlainObject(spec.context)) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('context'), message: 'context must be an object' });
+    } else if (spec.context.notes !== undefined && typeof spec.context.notes !== 'string') {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('context.notes'), message: 'context.notes must be a string' });
+    }
+  }
+  if (spec.degrade !== undefined) {
+    if (!Array.isArray(spec.degrade)) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('degrade'), message: 'degrade must be an array' });
+    } else {
+      spec.degrade.forEach((d, idx) => {
+        if (!isPlainObject(d)) {
+          v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p(`degrade[${idx}]`), message: 'degrade entry must be an object' });
+        }
+      });
+    }
+  }
+  if (isPatch) {
+    if (spec.title !== undefined && (typeof spec.title !== 'string' || spec.title.length < 1 || spec.title.length > 120)) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('title'), message: 'title must be 1..120 chars' });
+    }
+    if (spec.runner !== undefined && (typeof spec.runner !== 'string' || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(spec.runner))) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('runner'), message: 'Invalid runner slug' });
+    }
+    if (spec.account !== undefined && spec.account !== null && (typeof spec.account !== 'string' || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(spec.account))) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('account'), message: 'Invalid account slug' });
+    }
+    if (spec.model !== undefined && (typeof spec.model !== 'string' || spec.model.length < 1)) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('model'), message: 'model must be a non-empty string' });
+    }
+    if (spec.reasoning_effort !== undefined && (typeof spec.reasoning_effort !== 'string' || !['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'default'].includes(spec.reasoning_effort))) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('reasoning_effort'), message: 'Invalid reasoning_effort' });
+    }
+    if (spec.tier_rationale !== undefined && (typeof spec.tier_rationale !== 'string' || spec.tier_rationale.length < 1 || spec.tier_rationale.length > 200)) {
+      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('tier_rationale'), message: 'tier_rationale must be 1..200 chars' });
+    }
+  }
+  return v;
 }
 
 export interface OutOfPhaseResult {
@@ -155,6 +277,7 @@ export interface ResolvedRunTarget {
     runner: string;
     account: string;
     model: string;
+    aliases: string[];
     tier: Tier;
     reasoning_effort: string;
     resolved_native: string | null;
@@ -181,7 +304,7 @@ export function validateRunSpec(params: {
   resolved: ResolvedRunTarget | null;
 } {
   const { spec, pathPrefix, taskLevel, project, runners } = params;
-  const violations: Violation[] = [];
+  const violations: Violation[] = [...validateRunSpecTypes(spec, pathPrefix, false)];
   const warnings: WarningItem[] = [];
 
   const role = spec.role;
@@ -388,6 +511,7 @@ export function validateRunSpec(params: {
         runner: runner.id,
         account: acc.id,
         model: modelEntry.id,
+        aliases: [...modelEntry.aliases],
         tier: modelEntry.tier,
         reasoning_effort: String(effortReq),
         resolved_native: effortReq === 'default' ? null : String(effortReq),

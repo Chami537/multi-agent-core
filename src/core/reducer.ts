@@ -4,7 +4,15 @@ import { aggregateUsage, counters } from './usage.js';
 
 export function applyEvent(run: Run, event: RunnerEvent, now: number): void {
   if (run.candidate) { run.protocolViolation = 'output after run.finished'; return; }
-  if (event.type === 'session.started' && !['native_session_id','model','reasoning_effort','native_version'].every(k => k in event.data)) throw new Error('invalid_session_started');
+  if (event.type === 'session.started') {
+    if (!['native_session_id','model','reasoning_effort','native_version'].every(k => k in event.data)) throw new Error('invalid_session_started');
+    if (event.data.model && typeof event.data.model === 'object' && !Array.isArray(event.data.model)) {
+      run.reportedModel = { ...(event.data.model as Record<string, unknown>) };
+    }
+    if (event.data.reasoning_effort && typeof event.data.reasoning_effort === 'object' && !Array.isArray(event.data.reasoning_effort)) {
+      run.reportedEffort = { ...(event.data.reasoning_effort as Record<string, unknown>) };
+    }
+  }
   if (event.type === 'tool.call' || event.type === 'file.changed') run.hadWorkEvents = true;
   let usageChanged = false;
   if (event.type === 'usage' || event.type === 'run.finished') {
@@ -33,6 +41,12 @@ export function applyEvent(run: Run, event: RunnerEvent, now: number): void {
       || !data.model || !data.reasoning_effort || (data.outcome === 'failed' && typeof data.error?.code !== 'string')
       || (data.outcome !== 'failed' && data.error !== null)) throw new Error('invalid_finished');
     if (data.outcome === 'awaiting_input' && (run.inputMode !== 'resume' || !data.resume_token)) throw new Error('invalid_resume_candidate');
+    if (data.model && typeof data.model === 'object' && !Array.isArray(data.model)) {
+      run.reportedModel = { ...(data.model as Record<string, unknown>) };
+    }
+    if (data.reasoning_effort && typeof data.reasoning_effort === 'object' && !Array.isArray(data.reasoning_effort)) {
+      run.reportedEffort = { ...(data.reasoning_effort as Record<string, unknown>) };
+    }
     recordCandidate(run, data, now);
   }
   if (run.state === 'running' && (['session.started','message','reasoning','tool.call','tool.result','file.changed','model.changed','turn.completed','native.unknown'].includes(event.type) || usageChanged)) run.clocks.idleSince = now;

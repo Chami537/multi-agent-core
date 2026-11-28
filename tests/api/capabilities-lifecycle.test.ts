@@ -1,4 +1,5 @@
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -24,6 +25,12 @@ describe('API Capabilities, 3-Stage Model/Effort, and Run/Task Lifecycle', () =>
     root = mkdtempSync(join(tmpdir(), 'mac-api-cap-'));
     const repoPath = join(root, 'repo');
     mkdirSync(repoPath, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoPath });
+    execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: repoPath });
+    execFileSync('git', ['config', 'user.name', 'Test'], { cwd: repoPath });
+    writeFileSync(join(repoPath, 'README.md'), 'init\n');
+    execFileSync('git', ['add', '.'], { cwd: repoPath });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repoPath });
     runtime = new Runtime({ root: join(root, 'rt'), preserve: markerPreserver, timing: { exitMs: 120, killMs: 70, graceMs: 70 } });
     const caps = defaultFakeCapabilities();
     // Add an advisory-only runner without enforceable read_only
@@ -193,12 +200,27 @@ describe('API Capabilities, 3-Stage Model/Effort, and Run/Task Lifecycle', () =>
     expect(rComplete.status).toBe(202);
 
     await state(runtime, runId, 'done');
+    const doneRun = runtime.store.get(runId);
+    const headSha = doneRun.preservation.sha ?? doneRun.workspaceHead!;
+    expect(headSha).toMatch(/^[0-9a-f]{40}$/);
+
+    // Zero-SHA ruling must be rejected (R8)
+    const rBadRuling = await fetch(`${baseUrl}/v0/tasks/${taskId}/rulings`, {
+      method: 'POST',
+      headers: hdrs('k-e2e-ruling-bad'),
+      body: JSON.stringify({
+        subject: { run_id: runId, sha: '0'.repeat(40) },
+        decision: 'accept',
+        note: 'bad sha',
+      }),
+    });
+    expect(rBadRuling.status).toBe(422);
 
     const rRuling = await fetch(`${baseUrl}/v0/tasks/${taskId}/rulings`, {
       method: 'POST',
       headers: hdrs('k-e2e-ruling'),
       body: JSON.stringify({
-        subject: { run_id: runId, sha: '0'.repeat(40) },
+        subject: { run_id: runId, sha: headSha },
         decision: 'accept',
         note: 'looks good',
       }),

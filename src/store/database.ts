@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import type { Run } from '../core/types.js';
 
 export interface GlobalEvent { seq: number; type: string; ts: string; project_id: string | null; task_id: string | null; run_id: string | null; data: Record<string, unknown> }
+export interface EventTarget { projectId: string | null; taskId?: string | null; id?: string | null }
 export class Store {
   readonly db: DatabaseSync;
   private inTransaction = false;
@@ -50,11 +51,14 @@ export class Store {
       return { epoch: old.epoch + 1, hostRestart: old.boot !== null && old.boot !== bootId };
     });
   }
-  emit(type: string, data: Record<string, unknown>, run: Run | null = null, now = Date.now()): GlobalEvent {
+  emit(type: string, data: Record<string, unknown>, target: Run | EventTarget | null = null, now = Date.now()): GlobalEvent {
     this.assertTransaction();
     if (this.meta().high >= Number.MAX_SAFE_INTEGER) throw new Error('sequence_exhausted');
     const row = this.db.prepare('UPDATE instance_meta SET high_seq=high_seq+1 WHERE id=1 RETURNING high_seq').get()!;
-    const event: GlobalEvent = { seq: Number(row.high_seq), type, ts: new Date(now).toISOString(), project_id: run?.projectId ?? null, task_id: run?.taskId ?? null, run_id: run?.id ?? null, data };
+    const projectId = target?.projectId ?? null;
+    const taskId = target && 'taskId' in target ? (target.taskId ?? null) : null;
+    const runId = target && 'id' in target ? (target.id ?? null) : null;
+    const event: GlobalEvent = { seq: Number(row.high_seq), type, ts: new Date(now).toISOString(), project_id: projectId, task_id: taskId, run_id: runId, data };
     this.db.prepare('INSERT INTO events VALUES (?,?,?)').run(event.seq, now, JSON.stringify(event)); return event;
   }
   activity(run: Run, segment: number, type: string, data: Record<string, unknown>, ts = new Date().toISOString()): number {

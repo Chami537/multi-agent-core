@@ -26,6 +26,9 @@ export interface CreateRun {
   // Internal fake harness limit; D1 does not expose public Supervisor budget fields.
   fakeMaxSteps?: number | null;
   timeouts?: Partial<Timeouts>;
+  readOnly?: boolean;
+  forbidden?: string[];
+  modelAliases?: string[];
 }
 export class Runtime {
   readonly store: Store;
@@ -37,6 +40,10 @@ export class Runtime {
   private ticking = false;
   private closed = false;
   private readonly timing: Timing;
+  private prepareStartHook: ((run: Run, now: number) => { workspace: string; workspaceHead?: string | null } | void) | null = null;
+  setPrepareStart(hook: (run: Run, now: number) => { workspace: string; workspaceHead?: string | null } | void): void {
+    this.prepareStartHook = hook;
+  }
   constructor(private readonly options: RuntimeOptions) {
     this.root = resolve(options.root); mkdirSync(this.root, { recursive: true, mode: 0o700 });
     const release = tryLock(join(this.root, 'instance.lock')); if (!release) throw new Error('instance_locked');
@@ -47,7 +54,7 @@ export class Runtime {
     } catch (error) { release(); throw error; }
   }
   create(options: CreateRun): Run {
-    const allowed = ['id','projectId','taskId','account','workspace','prompt','inputMode','role','model','reasoningEffort','fakeMaxSteps','timeouts'];
+    const allowed = ['id','projectId','taskId','account','workspace','prompt','inputMode','role','model','reasoningEffort','fakeMaxSteps','timeouts','readOnly','forbidden','modelAliases'];
     for (const key of Object.keys(options)) if (!allowed.includes(key)) unsupported(key, ['budget', 'max_steps'].includes(key) ? 'Phase 3' : 'D2 or later');
     if (options.role && !['dev', 'design'].includes(options.role)) unsupported(`role:${options.role}`, 'Phase 4');
     if (options.model && options.model !== 'fake-high') throw new Error('MODEL_UNAVAILABLE');
@@ -68,7 +75,8 @@ export class Runtime {
       state: 'queued', reason: null, version: 1, inputMode: options.inputMode ?? 'none', role: options.role ?? 'dev', model: options.model ?? 'fake-high', reasoningEffort: options.reasoningEffort ?? 'default',
       reservation: false, segment: 0, launchAttempts: 0, intent: null, finalizing: false, stop: null, candidate: null,
       usage: aggregateUsage({}), segmentUsage: {}, previousSteps: 0, protocolViolation: null, timeouts, clocks: { totalMs: 0, runningSince: null, idleSince: null, waitingSince: null }, preservation: { state: 'not_required', kind: null, error: null, sha: null }, protected: false, messages: [], resumeToken: null,
-      cleanupTermAt: null, outputDrained: false, groupEmpty: false, workspaceHead: null, hadWorkEvents: false, workspace: resolve(options.workspace), runDir, prompt: options.prompt ?? '', maxSteps: options.fakeMaxSteps ?? null };
+      cleanupTermAt: null, outputDrained: false, groupEmpty: false, workspaceHead: null, hadWorkEvents: false, workspace: resolve(options.workspace), runDir, prompt: options.prompt ?? '', maxSteps: options.fakeMaxSteps ?? null,
+      readOnly: Boolean(options.readOnly ?? false), forbidden: options.forbidden ? [...options.forbidden] : [], modelAliases: options.modelAliases ? [...options.modelAliases] : [] };
     assertTransition(null, 'queued', 'T1');
     this.store.transaction(() => { this.store.put(run); this.store.emit('run.created', { run, version: run.version }, run); stateEvent(this.store, run, null, Date.now()); });
     return run;
@@ -99,6 +107,10 @@ export class Runtime {
     if (r.state === 'waiting' && r.inputMode === 'stdin') { this.deliverStdin(r, now); return; }
     if (!['queued','leasing','waiting'].includes(r.state)) throw new Error('invalid_start_state');
     const isResume = r.state === 'waiting';
+    if (!isResume && r.segment === 0 && this.prepareStartHook) {
+      const prep = this.prepareStartHook(r, now);
+      if (prep?.workspace) r.workspace = resolve(prep.workspace);
+    }
     const workspaceBefore = workspaceState(r.workspace);
     const message = r.messages.find(m => m.state === 'pending');
     this.store.transaction(() => {
@@ -116,8 +128,8 @@ export class Runtime {
     for (const directory of [artifacts, scratch, home]) mkdirSync(directory, { recursive: true, mode: 0o700 });
     const native = ({ default: null, low: 'l', medium: 'm', high: 'h' } as Record<string, string | null>)[r.reasoningEffort] ?? null;
     const start: StartParams = { run_id: id, segment: r.segment, prompt: { text: r.prompt, format: 'markdown' }, model: { id: r.model }, reasoning_effort: { effort: r.reasoningEffort, native },
-      interaction: r.inputMode === 'none' ? 'autonomous' : 'interactive', workspace: { cwd: r.workspace, read_only: false, artifacts_dir: artifacts, scratch_dir: scratch, readonly_paths: [] },
-      limits: { max_steps: r.maxSteps === null ? null : r.maxSteps - r.previousSteps, total_s: r.timeouts.total_s === null ? null : Math.max(0, r.timeouts.total_s - r.clocks.totalMs / 1000), idle_s: r.timeouts.idle_s }, forbidden: [],
+      interaction: r.inputMode === 'none' ? 'autonomous' : 'interactive', workspace: { cwd: r.workspace, read_only: Boolean(r.readOnly), artifacts_dir: artifacts, scratch_dir: scratch, readonly_paths: [] },
+      limits: { max_steps: r.maxSteps === null ? null : r.maxSteps - r.previousSteps, total_s: r.timeouts.total_s === null ? null : Math.max(0, r.timeouts.total_s - r.clocks.totalMs / 1000), idle_s: r.timeouts.idle_s }, forbidden: r.forbidden ?? [],
       resume: isResume && message && r.resumeToken ? { token: r.resumeToken, input: { input_id: message.id, text: message.text }, usage_baseline: null } : null,
       raw_dir: null, conformance: null };
     this.host.launch({ runDir: r.runDir, segment: r.segment, token: r.intent!.launchToken,
@@ -126,13 +138,17 @@ export class Runtime {
   }
   message(id: string, messageId: string, text: string): void {
     this.store.transaction(() => {
-      const r = this.store.get(id);
-      if (r.state !== 'waiting' || r.stop || r.finalizing) throw new Error('invalid_message_state');
-      const existing = r.messages.find(m => m.id === messageId);
-      if (existing) { if (existing.text !== text) throw new Error('input_conflict'); return; }
-      r.messages.push({ id: messageId, text, state: 'pending' }); r.clocks.waitingSince = null; r.version++; this.store.put(r);
-      this.store.emit('run.updated', { version: r.version, changes: { message: messageId } }, r);
+      this.messageInTransaction(id, messageId, text);
     });
+  }
+  messageInTransaction(id: string, messageId: string, text: string): Run {
+    const r = this.store.get(id);
+    if (r.state !== 'waiting' || r.stop || r.finalizing) throw new Error('invalid_message_state');
+    const existing = r.messages.find(m => m.id === messageId);
+    if (existing) { if (existing.text !== text) throw new Error('input_conflict'); return r; }
+    r.messages.push({ id: messageId, text, state: 'pending' }); r.clocks.waitingSince = null; r.version++; this.store.put(r);
+    this.store.emit('run.updated', { version: r.version, changes: { message: messageId } }, r);
+    return r;
   }
   private deliverStdin(r: Run, now: number): void {
     const message = r.messages.find(m => m.state === 'pending'); if (!message) throw new Error('no_pending_message');
@@ -150,31 +166,39 @@ export class Runtime {
       this.host.command(run.runDir,run.segment,{ kind:'rpc', id:row.command_id as string, method:row.method as string, params:JSON.parse(row.params as string) as Record<string, unknown> });
     }
   }
+  flushPendingCommands(run: Run): void {
+    this.flushCommands(run);
+  }
   stop(id: string, kind: StopKind = 'cancel', now = Date.now(), preserveWip = false, reason: string | null = null): void {
     this.store.transaction(() => {
-      const r = this.store.get(id);
-      const processlessCancel = kind === 'cancel' && !preserveWip && r.state === 'waiting' && r.inputMode === 'resume' && !r.finalizing;
-      requestStop(r, kind, now, preserveWip, reason); r.version++;
-      this.store.emit('run.stop_requested', { stop_request: r.stop, version: r.version }, r, now);
-      if (!['running','waiting'].includes(r.state) || processlessCancel) {
-        const from = r.state; r.outputDrained = r.groupEmpty = true; finalize(r, true, now); stateEvent(this.store, r, from, now);
-        this.store.emit('run.result', { version: r.version, preservation: r.preservation, reason: r.reason }, r, now);
-      }
-      this.store.put(r);
+      this.stopInTransaction(id, kind, now, preserveWip, reason);
     });
   }
+  stopInTransaction(id: string, kind: StopKind = 'cancel', now = Date.now(), preserveWip = false, reason: string | null = null): Run {
+    const r = this.store.get(id);
+    const processlessCancel = kind === 'cancel' && !preserveWip && r.state === 'waiting' && r.inputMode === 'resume' && !r.finalizing;
+    requestStop(r, kind, now, preserveWip, reason); r.version++;
+    this.store.emit('run.stop_requested', { stop_request: r.stop, version: r.version }, r, now);
+    if (!['running','waiting'].includes(r.state) || processlessCancel) {
+      const from = r.state; r.outputDrained = r.groupEmpty = true; finalize(r, true, now); stateEvent(this.store, r, from, now);
+      this.store.emit('run.result', { version: r.version, preservation: r.preservation, reason: r.reason }, r, now);
+    }
+    this.store.put(r);
+    return r;
+  }
   complete(id: string): void {
-    const r = this.store.transaction(() => {
-      const r = this.store.get(id);
-      if (r.state !== 'waiting' || r.stop || r.finalizing) throw new Error('invalid_complete_state');
-      if (r.inputMode === 'stdin') this.store.db.prepare('INSERT INTO commands(run_id,segment,command_id,method,params) VALUES (?,?,?,?,?)').run(r.id,r.segment,'complete','run.complete','{}');
-      else recordCandidate(r, this.syntheticFinished('completed', null, r), Date.now(), 'host');
-      r.finalizing = true; r.clocks.waitingSince = null;
-      for (const m of r.messages) if (m.state === 'pending') m.state = 'invalidated';
-      r.version++; this.store.put(r); this.store.emit('run.updated', { version: r.version, changes: { finalizing: true } }, r);
-      return r;
-    });
+    const r = this.store.transaction(() => this.completeInTransaction(id));
     if (r.inputMode === 'stdin') this.flushCommands(r);
+  }
+  completeInTransaction(id: string): Run {
+    const r = this.store.get(id);
+    if (r.state !== 'waiting' || r.stop || r.finalizing) throw new Error('invalid_complete_state');
+    if (r.inputMode === 'stdin') this.store.db.prepare('INSERT INTO commands(run_id,segment,command_id,method,params) VALUES (?,?,?,?,?)').run(r.id,r.segment,'complete','run.complete','{}');
+    else recordCandidate(r, this.syntheticFinished('completed', null, r), Date.now(), 'host');
+    r.finalizing = true; r.clocks.waitingSince = null;
+    for (const m of r.messages) if (m.state === 'pending') m.state = 'invalidated';
+    r.version++; this.store.put(r); this.store.emit('run.updated', { version: r.version, changes: { finalizing: true } }, r);
+    return r;
   }
   private syntheticFinished(outcome: Finished['outcome'], code: string | null, r: Run): Finished {
     const usage = r.segmentUsage[r.segment] ?? emptyUsage();

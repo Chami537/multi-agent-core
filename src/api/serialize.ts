@@ -1,6 +1,58 @@
 import { isTerminal } from '../core/state-machine.js';
 import type { Run, State } from '../core/types.js';
-import type { ReleaseState, RunMetadata, TaskRecord } from './types.js';
+import type { EffortThreeStageValue, ReleaseState, RunMetadata, TaskRecord, ThreeStageValue } from './types.js';
+
+export function buildModelAndEffortRecords(
+  run: Run,
+  meta: RunMetadata,
+): { model_record: ThreeStageValue; effort_record: EffortThreeStageValue } {
+  const repModel = run.reportedModel ?? (run.candidate?.data.model as Run['reportedModel'] | undefined);
+  const effectiveModel = typeof repModel?.effective === 'string' ? repModel.effective : null;
+  const modelSource: 'runner_reported' | 'unknown' =
+    effectiveModel !== null && (repModel?.effective_source === 'native_reported' || repModel?.effective_source === 'runner_reported')
+      ? 'runner_reported'
+      : 'unknown';
+  const auxiliary = Array.isArray(repModel?.auxiliary)
+    ? repModel.auxiliary.map(String)
+    : (meta.model_record.auxiliary ?? []);
+  const modelMismatch =
+    effectiveModel !== null && meta.model_record.resolved !== null
+      ? effectiveModel !== meta.model_record.resolved && !(run.modelAliases ?? []).includes(effectiveModel)
+      : meta.model_record.mismatch;
+
+  const model_record: ThreeStageValue = {
+    ...meta.model_record,
+    effective: effectiveModel ?? meta.model_record.effective,
+    effective_source: effectiveModel !== null ? modelSource : meta.model_record.effective_source,
+    auxiliary,
+    mismatch: modelMismatch,
+  };
+
+  const repEffort = run.reportedEffort ?? (run.candidate?.data.reasoning_effort as Run['reportedEffort'] | undefined);
+  const effectiveEffort = typeof repEffort?.effective === 'string' ? repEffort.effective : null;
+  const effortSource: 'runner_reported' | 'unknown' =
+    effectiveEffort !== null && (repEffort?.effective_source === 'native_reported' || repEffort?.effective_source === 'runner_reported')
+      ? 'runner_reported'
+      : 'unknown';
+  const resolvedNative =
+    typeof repEffort?.requested_native === 'string'
+      ? repEffort.requested_native
+      : meta.effort_record.resolved_native;
+  const effortMismatch =
+    effectiveEffort !== null && meta.effort_record.requested !== 'default'
+      ? effectiveEffort !== meta.effort_record.requested
+      : meta.effort_record.mismatch;
+
+  const effort_record: EffortThreeStageValue = {
+    ...meta.effort_record,
+    resolved_native: resolvedNative,
+    effective: effectiveEffort ?? meta.effort_record.effective,
+    effective_source: effectiveEffort !== null ? effortSource : meta.effort_record.effective_source,
+    mismatch: effortMismatch,
+  };
+
+  return { model_record, effort_record };
+}
 
 export function serializeTask(task: TaskRecord, runs: Run[]): Record<string, unknown> {
   const runCounts: Record<string, number> = {};
@@ -67,6 +119,7 @@ export function serializeUsage(run: Run): Record<string, unknown> {
 
 export function serializeRunResult(run: Run, meta: RunMetadata): Record<string, unknown> | null {
   if (!isTerminal(run.state) && run.state !== 'paused' && run.state !== 'waiting') return null;
+  const { model_record, effort_record } = buildModelAndEffortRecords(run, meta);
   return {
     code: run.reason ?? (run.state === 'done' ? 'completed' : run.state),
     branch: meta.branch,
@@ -87,8 +140,8 @@ export function serializeRunResult(run: Run, meta: RunMetadata): Record<string, 
     policy_breaches: [],
     degraded: meta.degraded,
     usage: serializeUsage(run),
-    model: meta.model_record,
-    reasoning_effort: meta.effort_record,
+    model: model_record,
+    reasoning_effort: effort_record,
     turns: run.candidate?.data.turns ?? null,
     steps: run.usage.steps,
     duration_s: Math.floor(run.clocks.totalMs / 1000),
@@ -96,13 +149,7 @@ export function serializeRunResult(run: Run, meta: RunMetadata): Record<string, 
 }
 
 export function serializeRun(run: Run, meta: RunMetadata, release: ReleaseState | null): Record<string, unknown> {
-  const effectiveModel = (run.candidate?.data.model?.id as string | undefined) ?? null;
-  const modelRecord = {
-    ...meta.model_record,
-    effective: effectiveModel ?? meta.model_record.effective,
-    effective_source: effectiveModel ? ('runner_reported' as const) : meta.model_record.effective_source,
-    mismatch: effectiveModel !== null && meta.model_record.resolved !== null ? effectiveModel !== meta.model_record.resolved : meta.model_record.mismatch,
-  };
+  const { model_record, effort_record } = buildModelAndEffortRecords(run, meta);
 
   return {
     id: run.id,
@@ -129,8 +176,8 @@ export function serializeRun(run: Run, meta: RunMetadata, release: ReleaseState 
     occupies_slot: run.reservation,
     waiting_on: null,
     placement: meta.placement,
-    model: modelRecord,
-    reasoning_effort: meta.effort_record,
+    model: model_record,
+    reasoning_effort: effort_record,
     tier_rationale: meta.tier_rationale,
     priority: meta.priority,
     critical: meta.critical,

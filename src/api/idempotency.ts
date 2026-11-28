@@ -88,7 +88,7 @@ export class IdempotencyManager {
     now = Date.now(),
   ):
     | { action: 'execute' }
-    | { action: 'replay'; statusCode: number; body: string }
+    | { action: 'replay'; statusCode: number; body: string; projectId: string | null }
     | { action: 'conflict'; firstRequestId: string; firstRequestedAt: string }
     | { action: 'in_progress' } {
     const slot = this.slotKey(scope);
@@ -127,6 +127,7 @@ export class IdempotencyManager {
               action: 'replay' as const,
               statusCode: Number(row.status_code),
               body: String(row.response_body),
+              projectId: (row.project_id as string | null | undefined) ?? null,
             };
           }
         }
@@ -155,18 +156,18 @@ export class IdempotencyManager {
   }
 
   /** Must be called inside an active store.transaction(...)! */
-  completeInTransaction(scope: IdempotencyScope, statusCode: number, responseBody: string, now = Date.now()): void {
+  completeInTransaction(scope: IdempotencyScope, statusCode: number, responseBody: string, now = Date.now(), projectId: string | null = null): void {
     this.store.db
       .prepare(
-        `UPDATE api_idempotency SET status='completed', status_code=?, response_body=?, completed_at=?
+        `UPDATE api_idempotency SET status='completed', status_code=?, response_body=?, project_id=?, completed_at=?
          WHERE principal=? AND method=? AND path=? AND idempotency_key=?`,
       )
-      .run(statusCode, responseBody, now, scope.principal, scope.method, scope.path, scope.key);
+      .run(statusCode, responseBody, projectId, now, scope.principal, scope.method, scope.path, scope.key);
   }
 
-  completeStandalone(scope: IdempotencyScope, statusCode: number, responseBody: string, now = Date.now()): void {
+  completeStandalone(scope: IdempotencyScope, statusCode: number, responseBody: string, now = Date.now(), projectId: string | null = null): void {
     this.store.transaction(() => {
-      this.completeInTransaction(scope, statusCode, responseBody, now);
+      this.completeInTransaction(scope, statusCode, responseBody, now, projectId);
     });
   }
 

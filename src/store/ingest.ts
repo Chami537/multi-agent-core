@@ -59,6 +59,20 @@ export function ingest(store: Store, runId: string, path: string, now = Date.now
           if (e.type === 'usage' || e.type === 'run.finished') {
             run.version++; store.emit('run.usage', { usage: run.usage, version: run.version }, run, now);
           }
+          if (reduce === applyEvent && (e.type === 'session.started' || e.type === 'run.finished')) {
+            const effModel = run.reportedModel?.effective;
+            if (typeof effModel === 'string' && effModel !== run.model && !(run.modelAliases ?? []).includes(effModel) && !run.modelMismatchAlerted) {
+              run.modelMismatchAlerted = true;
+              run.version++;
+              store.emit('alert', { kind: 'model_mismatch', resolved: run.model, effective: effModel, version: run.version }, run, now);
+            }
+            const effEffort = run.reportedEffort?.effective;
+            if (typeof effEffort === 'string' && run.reasoningEffort !== 'default' && effEffort !== run.reasoningEffort && !run.effortMismatchAlerted) {
+              run.effortMismatchAlerted = true;
+              run.version++;
+              store.emit('alert', { kind: 'effort_mismatch', requested: run.reasoningEffort, effective: effEffort, version: run.version }, run, now);
+            }
+          }
           count++;
         } else {
           // The shim's initial capabilities request is id 2; refusal keeps SIGTERM fallback.
