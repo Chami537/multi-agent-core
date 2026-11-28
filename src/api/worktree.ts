@@ -147,13 +147,14 @@ async function withRepoLock<T>(repoRoot: string, fn: () => Promise<T>): Promise<
   const prev = repoLocks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const next = new Promise<void>(r => { release = r; });
-  repoLocks.set(key, prev.then(() => next));
+  const queued = prev.then(() => next);
+  repoLocks.set(key, queued);
   await prev;
   try {
     return await fn();
   } finally {
     release();
-    if (repoLocks.get(key) === next) repoLocks.delete(key);
+    if (repoLocks.get(key) === queued) repoLocks.delete(key);
   }
 }
 
@@ -173,41 +174,52 @@ export async function executeWorktreeRelease(params: {
     const progress = currentRecord?.progress ?? { ref_tx_done: false, dir_removed: false };
     const requestedAt = currentRecord?.release.requested_at ?? new Date(now).toISOString();
 
+    if (progress.ref_tx_done) {
+      const currentBranch = git(repoRoot, ['rev-parse', '--verify', '--quiet', verified.branch]);
+      if (currentBranch.status === 0) {
+        const aborted: ReleaseState = { state: 'aborted', requested_at: requestedAt, released_at: null, error: { reason: 'run_branch_moved', message: 'Run branch reappeared after the committed delete' } };
+        store.transaction(() => {
+          const latest = store.get(run.id); latest.version++; store.put(latest);
+          saveReleaseRecord(store, run.id, { release: aborted, verified, progress }, now);
+          store.emit('run.updated', { version: latest.version, changes: { release: aborted } }, latest, now);
+        });
+        return;
+      }
+    }
     if (!progress.ref_tx_done) {
-      // Build atomic git update-ref --stdin transaction
-      const cmds: string[] = [];
+      // Progress is only a hint: Git may have committed before the database write.
+      const branchNow = git(repoRoot, ['rev-parse', '--verify', '--quiet', verified.branch]);
+      if (branchNow.status !== 0 && branchNow.status !== 1) throw new Error(`release_ref_probe_failed: ${branchNow.stderr.trim()}`);
+      const branchTip = branchNow.status === 0 ? branchNow.stdout.trim() : null;
+      let reason: string | null = null;
+      if (branchTip !== null && branchTip !== verified.branch_tip) reason = 'run_branch_moved';
       if (verified.kind === 'reachable_from' && verified.ref && verified.ref_sha) {
-        cmds.push(`verify ${verified.ref} ${verified.ref_sha}`);
+        const keep = git(repoRoot, ['rev-parse', '--verify', '--quiet', `${verified.ref}^{commit}`]);
+        if (keep.status !== 0 || keep.stdout.trim() !== verified.ref_sha) reason = 'preservation_ref_changed';
+        else if ([verified.branch_tip, verified.wip_sha].some(sha => sha && git(repoRoot, ['merge-base', '--is-ancestor', sha, verified.ref_sha!]).status !== 0)) reason = 'preservation_not_reachable';
       }
-      if (verified.branch_tip) {
-        cmds.push(`delete ${verified.branch} ${verified.branch_tip}`);
-      }
-
-      if (cmds.length > 0) {
+      // If B is gone and K still preserves the verified commits, the reference
+      // transaction already succeeded. Never replay its delete-old-value command.
+      if (!reason && branchTip !== null) {
+        const cmds: string[] = [];
+        if (verified.kind === 'reachable_from' && verified.ref && verified.ref_sha) cmds.push(`verify ${verified.ref} ${verified.ref_sha}`);
+        cmds.push(`delete ${verified.branch} ${branchTip}`);
         const tx = git(repoRoot, ['update-ref', '--stdin'], `${cmds.join('\n')}\n`);
-        if (tx.status !== 0) {
-          let reason = 'preservation_ref_changed';
-          if (verified.branch_tip) {
-            const curTip = git(repoRoot, ['rev-parse', '--verify', '--quiet', verified.branch]);
-            if (curTip.status !== 0 || curTip.stdout.trim() !== verified.branch_tip) {
-              reason = 'run_branch_moved';
-            }
-          }
-          const aborted: ReleaseState = {
-            state: 'aborted',
-            requested_at: requestedAt,
-            released_at: null,
-            error: { reason, message: tx.stderr.trim() || 'git update-ref transaction aborted' },
-          };
-          store.transaction(() => {
-            const latest = store.get(run.id);
-            latest.version++;
-            store.put(latest);
-            saveReleaseRecord(store, run.id, { release: aborted, verified, progress }, now);
-            store.emit('run.updated', { version: latest.version, changes: { release: aborted } }, latest, now);
-          });
-          return;
-        }
+        if (tx.status !== 0) reason = 'preservation_ref_changed';
+      }
+      if (reason) {
+        const aborted: ReleaseState = {
+          state: 'aborted', requested_at: requestedAt, released_at: null,
+          error: { reason, message: 'Git references no longer match the immutable release intent' },
+        };
+        store.transaction(() => {
+          const latest = store.get(run.id);
+          latest.version++;
+          store.put(latest);
+          saveReleaseRecord(store, run.id, { release: aborted, verified, progress }, now);
+          store.emit('run.updated', { version: latest.version, changes: { release: aborted } }, latest, now);
+        });
+        return;
       }
 
       progress.ref_tx_done = true;
@@ -278,6 +290,16 @@ export async function recoverWorktreeReleases(params: {
   }
 }
 
+export function resolveRunBase(repoRoot: string, base: { kind: string; ref?: string; sha: string | null }): string {
+  const isGit = git(repoRoot, ['rev-parse', '--is-inside-work-tree']);
+  if (isGit.status !== 0) throw new Error(`workspace_not_git_repo: ${repoRoot}`);
+  const target = base.sha ?? (base.ref ? `refs/heads/${base.ref}` : 'HEAD');
+  let resolved = git(repoRoot, ['rev-parse', '--verify', '--quiet', `${target}^{commit}`]);
+  if (resolved.status !== 0 && base.ref && !base.sha) resolved = git(repoRoot, ['rev-parse', '--verify', '--quiet', `${base.ref}^{commit}`]);
+  if (resolved.status !== 0) throw new Error(`base_ref_not_found: ${target}`);
+  return resolved.stdout.trim();
+}
+
 export function prepareRunWorktree(params: {
   repoRoot: string;
   worktreePath: string;
@@ -285,30 +307,51 @@ export function prepareRunWorktree(params: {
   base: { kind: string; ref?: string; sha: string | null };
 }): { baseSha: string } {
   const { repoRoot, worktreePath, branch, base } = params;
-  const isGit = git(repoRoot, ['rev-parse', '--is-inside-work-tree']);
-  if (isGit.status !== 0) {
-    throw new Error(`workspace_not_git_repo: ${repoRoot}`);
-  }
-  const target = base.sha ?? (base.ref ? `refs/heads/${base.ref}` : 'HEAD');
-  let resolved = git(repoRoot, ['rev-parse', '--verify', '--quiet', `${target}^{commit}`]);
-  if (resolved.status !== 0 && base.ref) {
-    resolved = git(repoRoot, ['rev-parse', '--verify', '--quiet', `${base.ref}^{commit}`]);
-  }
-  if (resolved.status !== 0) {
-    throw new Error(`base_ref_not_found: ${target}`);
-  }
-  const baseSha = resolved.stdout.trim();
-  mkdirSync(dirname(worktreePath), { recursive: true, mode: 0o700 });
+  const baseSha = resolveRunBase(repoRoot, base);
+  const fullBranch = branch.startsWith('refs/heads/') ? branch : `refs/heads/${branch}`;
+  const branchTip = git(repoRoot, ['rev-parse', '--verify', '--quiet', fullBranch]);
+  if (branchTip.status === 0 && branchTip.stdout.trim() !== baseSha) throw new Error('prepare_branch_moved');
   if (existsSync(worktreePath)) {
-    git(repoRoot, ['worktree', 'remove', '--force', worktreePath]);
-    if (existsSync(worktreePath)) rmSync(worktreePath, { recursive: true, force: true });
+    const current = git(worktreePath, ['symbolic-ref', '--quiet', 'HEAD']);
+    const head = git(worktreePath, ['rev-parse', '--verify', 'HEAD']);
+    const top = git(worktreePath, ['rev-parse', '--show-toplevel']);
+    if (current.stdout.trim() === fullBranch && head.stdout.trim() === baseSha && resolve(top.stdout.trim()) === resolve(worktreePath)) return { baseSha };
+    throw new Error('prepare_workspace_conflict');
   }
-  const fullBranch = branch.startsWith('refs/heads/') ? branch.slice('refs/heads/'.length) : branch;
-  const addRes = git(repoRoot, ['worktree', 'add', '-b', fullBranch, worktreePath, baseSha]);
-  if (addRes.status !== 0) {
-    throw new Error(`worktree_create_failed: ${addRes.stderr.trim() || addRes.stdout.trim()}`);
-  }
+  mkdirSync(dirname(worktreePath), { recursive: true, mode: 0o700 });
+  // Remove stale registrations left by an interrupted add, never user files.
+  git(repoRoot, ['worktree', 'prune']);
+  const addRes = branchTip.status === 0
+    ? git(repoRoot, ['worktree', 'add', worktreePath, fullBranch.slice('refs/heads/'.length)])
+    : git(repoRoot, ['worktree', 'add', '-b', fullBranch.slice('refs/heads/'.length), worktreePath, baseSha]);
+  if (addRes.status !== 0) throw new Error(`worktree_create_failed: ${addRes.stderr.trim() || addRes.stdout.trim()}`);
   return { baseSha };
+}
+
+export function currentHead(repoRoot: string): string {
+  const ref = git(repoRoot, ['symbolic-ref', '--quiet', 'HEAD']);
+  if (ref.status === 0) return ref.stdout.trim();
+  return resolveRunBase(repoRoot, { kind: 'commit', sha: null });
+}
+
+export function prepareInPlace(repoRoot: string, branch: string, baseSha: string): void {
+  const fullBranch = branch.startsWith('refs/heads/') ? branch : `refs/heads/${branch}`;
+  const tip = git(repoRoot, ['rev-parse', '--verify', '--quiet', fullBranch]);
+  if (tip.status === 0 && tip.stdout.trim() !== baseSha) throw new Error('prepare_branch_moved');
+  const checkout = tip.status === 0
+    ? git(repoRoot, ['checkout', fullBranch.slice('refs/heads/'.length)])
+    : git(repoRoot, ['checkout', '-b', fullBranch.slice('refs/heads/'.length), baseSha]);
+  if (checkout.status !== 0) throw new Error(`in_place_checkout_failed: ${checkout.stderr.trim()}`);
+}
+
+export function restoreInPlace(repoRoot: string, originalHead: string): void {
+  if (currentHead(repoRoot) === originalHead) return;
+  const st = git(repoRoot, ['status', '--porcelain', '--untracked-files=all']);
+  if (st.status !== 0 || st.stdout.length > 0) throw new Error('in_place_restore_dirty');
+  const checkout = originalHead.startsWith('refs/heads/')
+    ? git(repoRoot, ['checkout', originalHead.slice('refs/heads/'.length)])
+    : git(repoRoot, ['checkout', '--detach', originalHead]);
+  if (checkout.status !== 0) throw new Error(`in_place_restore_failed: ${checkout.stderr.trim()}`);
 }
 
 export function checkInPlaceWorkspace(params: {
@@ -319,7 +362,7 @@ export function checkInPlaceWorkspace(params: {
 }): void {
   const { repoRoot, store, projectId, runId } = params;
   const active = store.list().filter(
-    r => r.id !== runId && r.projectId === projectId && ['leasing', 'running', 'waiting'].includes(r.state),
+    r => r.id !== runId && (r.projectId === projectId || resolve(r.workspace) === resolve(repoRoot)) && (['leasing', 'running', 'waiting'].includes(r.state) || r.protected),
   );
   for (const r of active) {
     const row = store.db.prepare('SELECT payload FROM api_runs WHERE id=?').get(r.id) as { payload: string } | undefined;
@@ -336,4 +379,8 @@ export function checkInPlaceWorkspace(params: {
       throw new Error('in_place_workspace_dirty');
     }
   }
+}
+
+export function commitContainsFile(repoRoot: string, sha: string, path: string): boolean {
+  return git(repoRoot, ['cat-file', '-e', `${sha}:${path}`]).status === 0;
 }

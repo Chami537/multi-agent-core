@@ -220,6 +220,7 @@ export interface RunMetadata {
   };
   model_record: ThreeStageValue;
   effort_record: EffortThreeStageValue;
+  review_of?: { run_id: string; sha: string };
   tier_rationale: string;
   priority: number;
   critical: boolean;

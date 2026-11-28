@@ -149,8 +149,8 @@ describe('API Capabilities, 3-Stage Model/Effort, and Run/Task Lifecycle', () =>
     expect(rOkDegrade.status).toBe(201);
     const bOk = await rOkDegrade.json() as { runs: { degraded: unknown[]; model: Record<string, unknown>; reasoning_effort: Record<string, unknown> }[] };
     expect(bOk.runs[0]!.degraded).toHaveLength(1);
-    expect(bOk.runs[0]!.model).toMatchObject({ requested: '@high', resolved: 'fake-high', effective: null, effective_source: 'unknown' });
-    expect(bOk.runs[0]!.reasoning_effort).toMatchObject({ requested: 'high', resolved_native: 'high', effective: null, effective_source: 'unknown' });
+    expect(bOk.runs[0]!.model).toMatchObject({ requested: '@high', resolved: null, effective: null, effective_source: 'unknown' });
+    expect(bOk.runs[0]!.reasoning_effort).toMatchObject({ requested: 'high', resolved_native: null, effective: null, effective_source: 'unknown' });
   });
 
   it('end-to-end interactive run: create -> start -> message -> complete -> ruling -> close', async () => {

@@ -13,6 +13,10 @@ export function applyEvent(run: Run, event: RunnerEvent, now: number): void {
       run.reportedEffort = { ...(event.data.reasoning_effort as Record<string, unknown>) };
     }
   }
+  if (event.type === 'model.changed') {
+    if (event.data.model && typeof event.data.model === 'object' && !Array.isArray(event.data.model)) run.reportedModel = { ...run.reportedModel, ...(event.data.model as Record<string, unknown>) };
+    if (event.data.reasoning_effort && typeof event.data.reasoning_effort === 'object' && !Array.isArray(event.data.reasoning_effort)) run.reportedEffort = { ...run.reportedEffort, ...(event.data.reasoning_effort as Record<string, unknown>) };
+  }
   if (event.type === 'tool.call' || event.type === 'file.changed') run.hadWorkEvents = true;
   let usageChanged = false;
   if (event.type === 'usage' || event.type === 'run.finished') {

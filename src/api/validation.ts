@@ -125,6 +125,11 @@ export function validateRunSpecTypes(spec: Record<string, unknown>, prefix: stri
       v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('fallbacks'), message: 'fallbacks must be an array of objects' });
     }
   }
+  if (Array.isArray(spec.fallbacks)) {
+    spec.fallbacks.forEach((fallback, index) => {
+      if (isPlainObject(fallback)) v.push(...validateRunSpecTypes(fallback, p(`fallbacks[${index}]`), true));
+    });
+  }
   if (spec.waivers !== undefined) {
     if (!Array.isArray(spec.waivers) || spec.waivers.some(w => typeof w !== 'string' && !isPlainObject(w))) {
       v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('waivers'), message: 'waivers must be an array of strings or objects' });
@@ -148,8 +153,18 @@ export function validateRunSpecTypes(spec: Record<string, unknown>, prefix: stri
   if (spec.base !== undefined) {
     if (!isPlainObject(spec.base)) {
       v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('base'), message: 'base must be an object' });
-    } else if (typeof spec.base.kind !== 'string' || !['branch', 'commit', 'wip', 'run'].includes(spec.base.kind)) {
-      v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('base.kind'), message: 'base.kind must be branch, commit, wip, or run' });
+    } else {
+      if (typeof spec.base.kind !== 'string' || !['branch', 'commit', 'wip', 'run'].includes(spec.base.kind)) {
+        v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('base.kind'), message: 'base.kind must be branch, commit, wip, or run' });
+      }
+      for (const field of ['ref', 'sha', 'run_id']) {
+        const value = spec.base[field];
+        if (value !== undefined && (typeof value !== 'string' || value.length === 0)) {
+          v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p(`base.${field}`), message: `base.${field} must be a non-empty string` });
+        }
+      }
+      const required = spec.base.kind === 'branch' ? 'ref' : spec.base.kind === 'run' ? 'run_id' : 'sha';
+      if (spec.base[required] === undefined) v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p(`base.${required}`), message: `base.${required} is required` });
     }
   }
   if (spec.context !== undefined) {
@@ -166,9 +181,16 @@ export function validateRunSpecTypes(spec: Record<string, unknown>, prefix: stri
       spec.degrade.forEach((d, idx) => {
         if (!isPlainObject(d)) {
           v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p(`degrade[${idx}]`), message: 'degrade entry must be an object' });
+        } else {
+          for (const field of DEGRADE_FIELDS) {
+            if (typeof d[field] !== 'string') v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p(`degrade[${idx}].${field}`), message: `degrade.${field} must be a string` });
+          }
         }
       });
     }
+  }
+  if (spec.interaction !== undefined && (typeof spec.interaction !== 'string' || !['autonomous', 'interactive'].includes(spec.interaction))) {
+    v.push({ rule: 'SCHEMA_INVALID', kind: 'schema', path: p('interaction'), message: 'interaction must be autonomous or interactive' });
   }
   if (isPatch) {
     if (spec.title !== undefined && (typeof spec.title !== 'string' || spec.title.length < 1 || spec.title.length > 120)) {

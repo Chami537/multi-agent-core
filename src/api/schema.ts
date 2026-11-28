@@ -54,6 +54,17 @@ export function ensureApiSchema(db: DatabaseSync): void {
       created_at INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS api_verdicts (
+      run_id TEXT PRIMARY KEY,
+      task_id TEXT NOT NULL,
+      payload TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS api_start_preparations (
+      run_id TEXT PRIMARY KEY,
+      payload TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS api_worktree_releases (
       run_id TEXT PRIMARY KEY,
       payload TEXT NOT NULL,

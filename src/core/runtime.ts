@@ -7,7 +7,7 @@ import { ingest, stateEvent } from '../store/ingest.js';
 import { Host, safeEnvironment } from '../host/manager.js';
 import { bootId, tryLock } from '../host/process.js';
 import { workspaceState } from '../host/workspace.js';
-import { environmentFailure, noWorkProduced } from './launch.js';
+import { environmentFailure, nativeEffort, noWorkProduced } from './launch.js';
 import { repairTail } from '../host/logs.js';
 import { decide, type Snapshot } from './decide.js';
 import { candidateOutcome, cleanupAction, defaultTiming, finalize, move, recordCandidate, requestStop, type Timing } from './lifecycle.js';
@@ -43,6 +43,20 @@ export class Runtime {
   private prepareStartHook: ((run: Run, now: number) => { workspace: string; workspaceHead?: string | null } | void) | null = null;
   setPrepareStart(hook: (run: Run, now: number) => { workspace: string; workspaceHead?: string | null } | void): void {
     this.prepareStartHook = hook;
+  }
+  private beforeFinalizeHook: ((run: Run, now: number) => void) | null = null;
+  private finalizedHook: ((run: Run, now: number) => void) | null = null;
+  setFinalizeHooks(before: (run: Run, now: number) => void, after: (run: Run, now: number) => void): void {
+    this.beforeFinalizeHook = before;
+    this.finalizedHook = after;
+  }
+  private finalizeRun(run: Run, preservationOK = true, now = Date.now()): void {
+    if (candidateOutcome(run).state !== 'waiting') {
+      if (run.segment > 0) run.workspaceHead = workspaceState(run.workspace).head;
+      this.beforeFinalizeHook?.(run, now);
+    }
+    finalize(run, preservationOK && !run.deliverableInvalid, now);
+    if (isTerminal(run.state)) this.finalizedHook?.(run, now);
   }
   constructor(private readonly options: RuntimeOptions) {
     this.root = resolve(options.root); mkdirSync(this.root, { recursive: true, mode: 0o700 });
@@ -115,6 +129,7 @@ export class Runtime {
     const message = r.messages.find(m => m.state === 'pending');
     this.store.transaction(() => {
       const from = r.state;
+      r.startResolution = { model: r.model, nativeEffort: nativeEffort(r.reasoningEffort) };
       r.previousSteps = r.usage.steps ?? 0;
       r.segment++; r.intent = { runId: r.id, segment: r.segment, segmentKind: isResume ? 'resume' : r.launchAttempts ? 'launch_retry' : 'initial', launchToken: randomUUID(), daemonEpoch: this.epoch, status: 'pending' };
       r.candidate = null; r.stop = null; r.finalizing = false; r.cleanupTermAt = null; r.segmentUsage[r.segment] = emptyUsage(); r.usage = aggregateUsage(r.segmentUsage); r.protocolViolation = null;
@@ -126,7 +141,7 @@ export class Runtime {
     });
     const artifacts = join(r.runDir, 'artifacts'), scratch = join(r.runDir, 'scratch'), home = join(this.root, 'accounts', r.account);
     for (const directory of [artifacts, scratch, home]) mkdirSync(directory, { recursive: true, mode: 0o700 });
-    const native = ({ default: null, low: 'l', medium: 'm', high: 'h' } as Record<string, string | null>)[r.reasoningEffort] ?? null;
+    const native = r.startResolution!.nativeEffort;
     const start: StartParams = { run_id: id, segment: r.segment, prompt: { text: r.prompt, format: 'markdown' }, model: { id: r.model }, reasoning_effort: { effort: r.reasoningEffort, native },
       interaction: r.inputMode === 'none' ? 'autonomous' : 'interactive', workspace: { cwd: r.workspace, read_only: Boolean(r.readOnly), artifacts_dir: artifacts, scratch_dir: scratch, readonly_paths: [] },
       limits: { max_steps: r.maxSteps === null ? null : r.maxSteps - r.previousSteps, total_s: r.timeouts.total_s === null ? null : Math.max(0, r.timeouts.total_s - r.clocks.totalMs / 1000), idle_s: r.timeouts.idle_s }, forbidden: r.forbidden ?? [],
@@ -180,7 +195,7 @@ export class Runtime {
     requestStop(r, kind, now, preserveWip, reason); r.version++;
     this.store.emit('run.stop_requested', { stop_request: r.stop, version: r.version }, r, now);
     if (!['running','waiting'].includes(r.state) || processlessCancel) {
-      const from = r.state; r.outputDrained = r.groupEmpty = true; finalize(r, true, now); stateEvent(this.store, r, from, now);
+      const from = r.state; r.outputDrained = r.groupEmpty = true; this.finalizeRun(r, true, now); stateEvent(this.store, r, from, now);
       this.store.emit('run.result', { version: r.version, preservation: r.preservation, reason: r.reason }, r, now);
     }
     this.store.put(r);
@@ -218,13 +233,13 @@ export class Runtime {
           this.store.emit('alert', { kind: 'host_restart', run_id: recovered.id }, recovered);
           if (!recovered.stop && !recovered.candidate) recordCandidate(recovered, this.syntheticFinished('failed', 'host_restart', recovered), Date.now(), 'host');
           if (candidateOutcome(recovered).state === 'waiting') {
-            const from = recovered.state; finalize(recovered); stateEvent(this.store, recovered, from, Date.now());
+            const from = recovered.state; this.finalizeRun(recovered); stateEvent(this.store, recovered, from, Date.now());
           }
           this.store.put(recovered);
         });
         if (recovered.state === 'waiting' && !recovered.stop && !recovered.candidate) continue;
         if (recovered.stop?.kind === 'cancel' && !recovered.stop.preserveWip) {
-          this.store.transaction(() => { const from = recovered.state; finalize(recovered); this.store.put(recovered); stateEvent(this.store, recovered, from, Date.now()); });
+          this.store.transaction(() => { const from = recovered.state; this.finalizeRun(recovered); this.store.put(recovered); stateEvent(this.store, recovered, from, Date.now()); });
         } else await this.preserveAndFinalize(r.id, candidateOutcome(recovered).state === 'done' ? 'final' : 'wip');
         continue;
       }
@@ -254,7 +269,7 @@ export class Runtime {
     catch (error) { result = { state: 'failed', kind, sha: null, error: String(error) }; }
     this.store.transaction(() => {
       r = this.store.get(id); const from = r.state; r.preservation = result;
-      finalize(r, true, now);
+      this.finalizeRun(r, true, now);
       this.store.put(r); stateEvent(this.store, r, from, now);
       this.store.emit('run.result', { version: r.version, preservation: result, reason: r.reason }, r);
       if (result.state === 'failed') this.store.emit('alert', { kind: 'preservation_failed', error: result.error }, r);
@@ -342,14 +357,14 @@ export class Runtime {
     const choice = candidateOutcome(r);
     this.store.transaction(() => {
       r.outputDrained = true; r.groupEmpty = true;
-      if (choice.state === 'waiting') { const from = r.state; finalize(r, true, now); this.store.put(r); stateEvent(this.store, r, from, now); }
+      if (choice.state === 'waiting') { const from = r.state; this.finalizeRun(r, true, now); this.store.put(r); stateEvent(this.store, r, from, now); }
       else {
         r.finalizing = true; r.preservation = { state: 'pending', kind: choice.state === 'done' ? 'final' : 'wip', error: null, sha: null }; this.store.put(r);
       }
     });
     if (choice.state === 'waiting') return;
     if (r.segment === 0 || (r.stop?.kind === 'cancel' && !r.stop.preserveWip)) {
-      this.store.transaction(() => { const from = r.state; r.preservation = { state: 'not_required', kind: null, error: null, sha: null }; finalize(r, true, now); this.store.put(r); stateEvent(this.store, r, from, now); }); return;
+      this.store.transaction(() => { const from = r.state; r.preservation = { state: 'not_required', kind: null, error: null, sha: null }; this.finalizeRun(r, true, now); this.store.put(r); stateEvent(this.store, r, from, now); }); return;
     }
     await this.preserveAndFinalize(id, choice.state === 'done' ? 'final' : 'wip', now);
   }

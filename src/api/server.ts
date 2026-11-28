@@ -27,6 +27,7 @@ import {
   sha256Hex,
   ulid,
 } from './protocol.js';
+import { getReviewReceipt } from './reviews.js';
 import { ensureApiSchema } from './schema.js';
 import { allowedOpsForState, serializeRun, serializeRunResult, serializeTask } from './serialize.js';
 import {
@@ -57,11 +58,10 @@ import {
   validateRunSpecTypes,
   validateTaskLevel,
 } from './validation.js';
+import { configureRunLifecycle, recoverStartPreparations, verifyRulingSubject } from './run-lifecycle.js';
 import {
-  checkInPlaceWorkspace,
   executeWorktreeRelease,
   getReleaseState,
-  prepareRunWorktree,
   recoverWorktreeReleases,
   saveReleaseRecord,
   verifyWorktreePreservation,
@@ -152,34 +152,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
     return row ? (JSON.parse(row.payload) as RunMetadata) : null;
   };
 
-  runtime.setPrepareStart((run, now) => {
-    const meta = getRunMeta(run.id);
-    const project = projectMap.get(run.projectId);
-    if (!meta || !project) return;
-    const repoRoot = resolve(project.workspace_path);
-    if (meta.workspace_mode === 'worktree') {
-      const worktreePath = join(run.runDir, 'worktree');
-      const { baseSha } = prepareRunWorktree({
-        repoRoot,
-        worktreePath,
-        branch: meta.branch,
-        base: meta.base,
-      });
-      meta.base.sha = baseSha;
-      meta.base.resolved_at = new Date(now).toISOString();
-      meta.started_at = meta.started_at ?? new Date(now).toISOString();
-      store.transaction(() => {
-        store.db.prepare('UPDATE api_runs SET payload=? WHERE id=?').run(JSON.stringify(meta), run.id);
-      });
-      return { workspace: worktreePath };
-    }
-    checkInPlaceWorkspace({ repoRoot, store, projectId: project.id, runId: run.id });
-    meta.started_at = meta.started_at ?? new Date(now).toISOString();
-    store.transaction(() => {
-      store.db.prepare('UPDATE api_runs SET payload=? WHERE id=?').run(JSON.stringify(meta), run.id);
-    });
-    return { workspace: repoRoot };
-  });
+  configureRunLifecycle({ runtime, store, projectMap, getRunMeta });
 
   const buildRunFromSpec = (params: {
     runId: string;
@@ -560,22 +533,31 @@ export function createApiServer(config: ServerConfig): ApiServer {
 
     // Read JSON body for write requests
     let bodyObj: Record<string, unknown> = {};
+    let parsedBody: unknown = bodyObj;
+    let nonObjectBody = false;
     if (isWrite) {
       const parsed = await readJsonBody(req);
       if (!parsed.ok) {
         sendError(res, { status: 400, code: 'invalid_request', message: parsed.message, requestId, headers: respHeaders });
         return;
       }
-      if (!parsed.body || typeof parsed.body !== 'object' || Array.isArray(parsed.body)) {
-        sendError(res, { status: 400, code: 'invalid_request', message: 'Request body must be a JSON object', requestId, headers: respHeaders });
-        return;
-      }
-      bodyObj = parsed.body as Record<string, unknown>;
+      parsedBody = parsed.body;
+      nonObjectBody = !parsed.body || typeof parsed.body !== 'object' || Array.isArray(parsed.body);
+      if (!nonObjectBody) bodyObj = parsed.body as Record<string, unknown>;
+    }
+
+    if (method === 'PATCH' && nonObjectBody) {
+      sendError(res, { status: 400, code: 'invalid_request', message: 'Request body must be a JSON object', requestId, headers: respHeaders });
+      return;
     }
 
     // POST /v0/runs/validate
     if (method === 'POST' && path === '/v0/runs/validate') {
       if (!requireScope('submit')) return;
+      if (nonObjectBody) {
+        sendError(res, { status: 400, code: 'invalid_request', message: 'Request body must be a JSON object', requestId, headers: respHeaders });
+        return;
+      }
       const unknown = findUnknownFields(bodyObj, ['task_id', 'project_id', 'level', 'runs']);
       if (Array.isArray(bodyObj.runs)) {
         bodyObj.runs.forEach((r, i) => {
@@ -693,7 +675,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
         method,
         path,
         query: queryToObject(url),
-        body: bodyObj,
+        body: parsedBody,
       });
 
       const acquired = idempotency.checkAndAcquire(scope, fingerprint, requestId, permanent);
@@ -736,7 +718,9 @@ export function createApiServer(config: ServerConfig): ApiServer {
       }
 
       try {
-        const result = await fn(scope);
+        const result = nonObjectBody
+          ? { status: 400, body: { error: { code: 'invalid_request', message: 'Request body must be a JSON object', retryable: false, retry_after_s: null, request_id: requestId } }, alreadyCommittedInTx: false, projectId: null, headers: {} }
+          : await fn(scope);
         const bodyStr = typeof result.body === 'string' ? result.body : JSON.stringify(result.body);
         if (shouldRecordStatus(result.status)) {
           if (!result.alreadyCommittedInTx) {
@@ -748,6 +732,21 @@ export function createApiServer(config: ServerConfig): ApiServer {
         }
         sendJson(res, result.status, bodyStr, { ...respHeaders, ...(result.headers ?? {}) });
       } catch (err) {
+        // A durable response remains authoritative after its transaction commits,
+        // even if a post-commit delivery/recovery step throws.
+        const completed = idempotency.completedResponse(scope);
+        if (completed) {
+          idempotency.releaseInFlight(scope, false);
+          sendJson(res, completed.statusCode, completed.body, respHeaders);
+          return;
+        }
+        if (err instanceof InvalidState) {
+          const body = JSON.stringify({ error: { code: 'invalid_state', message: err.message, retryable: false, retry_after_s: null, request_id: requestId, details: { phase: err.phase } } });
+          idempotency.completeStandalone(scope, 409, body);
+          idempotency.releaseInFlight(scope, false);
+          sendJson(res, 409, body, respHeaders);
+          return;
+        }
         idempotency.releaseInFlight(scope, true);
         sendError(res, {
           status: 500,
@@ -1248,7 +1247,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
           for (const rid of task.run_ids) {
             const r = store.get(rid);
             if (!isTerminal(r.state)) {
-              try { runtime.stopInTransaction(rid, 'cancel', now, false, reason); } catch { /* ignore if finalizing */ }
+              runtime.stopInTransaction(rid, 'cancel', now, false, reason);
             }
           }
           task.state = 'cancelled';
@@ -1308,7 +1307,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
             for (const rid of task.run_ids) {
               const r = store.get(rid);
               if (!isTerminal(r.state)) {
-                try { runtime.stopInTransaction(rid, 'cancel', now, false, 'task_closed'); } catch { /* ignore if finalizing */ }
+                runtime.stopInTransaction(rid, 'cancel', now, false, 'task_closed');
               }
             }
           }
@@ -1378,15 +1377,15 @@ export function createApiServer(config: ServerConfig): ApiServer {
           typeof subject.run_id !== 'string' ||
           typeof subject.sha !== 'string' ||
           !/^[0-9a-f]{40}$/i.test(subject.sha) ||
-          !['accept', 'accept_with_notes', 'rework', 'reject'].includes(String(decision))
+          (typeof decision !== 'string' || !['accept', 'accept_with_notes', 'rework', 'reject'].includes(decision))
         ) {
           return { status: 400, body: { error: { code: 'invalid_request', message: 'Invalid subject or decision', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
         }
         if (bodyObj.based_on !== undefined && (!Array.isArray(bodyObj.based_on) || bodyObj.based_on.some(b => typeof b !== 'string' || b.length < 1))) {
           return { status: 400, body: { error: { code: 'invalid_request', message: 'based_on must be an array of non-empty strings', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
         }
-        if (bodyObj.note !== undefined && bodyObj.note !== null && typeof bodyObj.note !== 'string') {
-          return { status: 400, body: { error: { code: 'invalid_request', message: 'note must be a string or null', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
+        if (bodyObj.note !== undefined && bodyObj.note !== null && (typeof bodyObj.note !== 'string' || Buffer.byteLength(bodyObj.note) > 8192)) {
+          return { status: 400, body: { error: { code: 'invalid_request', message: 'note must be a string of at most 8 KiB or null', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
         }
         if (bodyObj.expected_branch_version !== undefined && (typeof bodyObj.expected_branch_version !== 'number' || !Number.isSafeInteger(bodyObj.expected_branch_version))) {
           return { status: 400, body: { error: { code: 'invalid_request', message: 'expected_branch_version must be an integer', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: task.project_id };
@@ -1406,21 +1405,26 @@ export function createApiServer(config: ServerConfig): ApiServer {
           if (!isTerminal(subjectRun.state)) {
             return { status: 409, body: { error: { code: 'invalid_state', message: `Subject run in state ${subjectRun.state} is not terminal`, retryable: false, retry_after_s: null, request_id: requestId, details: { state: subjectRun.state } } }, committed: false };
           }
-          const actualSha = subjectRun.preservation.sha ?? subjectRun.workspaceHead;
-          if ((actualSha !== null && subjectSha !== actualSha) || (actualSha === null && /^0{40}$/.test(subjectSha))) {
-            return { status: 422, body: { error: { code: 'validation_failed', message: 'Subject sha does not match run head_sha', retryable: false, retry_after_s: null, request_id: requestId, violations: [{ rule: 'SHA_MISMATCH', kind: 'review', path: 'subject.sha', message: `Expected ${actualSha ?? 'non-zero commit sha'}` }] } }, committed: false };
+          const subjectError = verifyRulingSubject(store, subjectRun, runMeta, subjectSha, projectMap.get(task.project_id)!);
+          if (subjectError) {
+            return { status: 422, body: { error: { code: 'validation_failed', message: subjectError, retryable: false, retry_after_s: null, request_id: requestId, violations: [{ rule: 'RULING_STALE_SUBJECT', kind: 'review', path: 'subject', message: subjectError }] } }, committed: false };
           }
 
           const existingRulings = store.db.prepare('SELECT id, payload FROM api_rulings WHERE task_id=?').all(task.id) as { id: string; payload: string }[];
-          const rulingIds = new Set(existingRulings.map(r => r.id));
           for (const refId of basedOn) {
-            if (!task.run_ids.includes(refId) && !rulingIds.has(refId)) {
-              return { status: 422, body: { error: { code: 'validation_failed', message: `based_on reference '${refId}' not found in task`, retryable: false, retry_after_s: null, request_id: requestId, violations: [{ rule: 'REF_UNKNOWN', kind: 'dependency', path: 'based_on', message: `Unknown reference ${refId}` }] } }, committed: false };
+            const reviewMeta = getRunMeta(refId);
+            const review = reviewMeta && reviewMeta.task_id === task.id ? store.get(refId) : null;
+            const verdict = getReviewReceipt(store, refId);
+            const reviewedMeta = verdict?.reviewed ? getRunMeta(verdict.reviewed.run_id) : null;
+            if (refId === subjectRunId || !review || !['review', 'audit'].includes(review.role) || review.state !== 'done'
+              || !verdict?.valid || verdict.status !== 'effective' || verdict.reviewed?.sha !== subjectSha || reviewedMeta?.lineage?.candidate?.sha !== subjectSha) {
+              return { status: 422, body: { error: { code: 'validation_failed', message: 'based_on must reference an effective review/audit of the subject SHA', retryable: false, retry_after_s: null, request_id: requestId, violations: [{ rule: 'RULING_STALE_REVIEW', kind: 'review', path: 'based_on', message: `Invalid or stale review ${refId}` }] } }, committed: false };
             }
           }
 
           const branchId = runMeta.lineage?.branch_id ?? subjectRunId;
-          const branchVersion = runMeta.lineage?.version ?? 1;
+          const branchMembers = store.db.prepare('SELECT payload FROM api_runs WHERE task_id=?').all(task.id) as { payload: string }[];
+          const branchVersion = Math.max(...branchMembers.map(row => JSON.parse(row.payload) as RunMetadata).filter(m => m.lineage?.branch_id === branchId).map(m => m.lineage!.version));
           if (bodyObj.expected_branch_version !== undefined && bodyObj.expected_branch_version !== branchVersion) {
             return { status: 409, body: { error: { code: 'version_conflict', message: 'Branch version conflict', retryable: true, retry_after_s: null, request_id: requestId } }, committed: false };
           }
@@ -1975,7 +1979,10 @@ export function createApiServer(config: ServerConfig): ApiServer {
           }
           throw err;
         }
-        if (committedRun.inputMode === 'stdin') runtime.flushPendingCommands(committedRun);
+        // Commands are durable. Delivery failure after commit must not change the recorded HTTP result.
+        if (committedRun.inputMode === 'stdin') {
+          try { runtime.flushPendingCommands(committedRun); } catch { /* tick/recovery retries undelivered commands */ }
+        }
         return { status: 202, body: respStr, alreadyCommittedInTx: true, projectId: meta.project_id };
       });
       return;
@@ -2064,7 +2071,10 @@ export function createApiServer(config: ServerConfig): ApiServer {
         }
 
         const project = projectMap.get(meta.project_id)!;
-        const baseSha = source.preservation.sha ?? source.workspaceHead ?? meta.base.sha;
+        const baseSha = mode === 'rework' ? source.workspaceHead : source.preservation.sha ?? source.workspaceHead ?? meta.base.sha;
+        if (mode === 'rework' && !baseSha) {
+          return { status: 409, body: { error: { code: 'invalid_state', message: 'rework requires the source terminal head_sha', retryable: false, retry_after_s: null, request_id: requestId } }, projectId: meta.project_id };
+        }
         const notesSuffix = typeof bodyObj.notes === 'string' && bodyObj.notes.length > 0 ? `\n\n[Continue Notes]\n${bodyObj.notes}` : '';
         const appendSuffix = typeof overrides.instructions_append === 'string' && overrides.instructions_append.length > 0 ? `\n\n${overrides.instructions_append}` : '';
         const newSpec: Record<string, unknown> = {
@@ -2080,11 +2090,17 @@ export function createApiServer(config: ServerConfig): ApiServer {
           workspace: meta.workspace_mode,
           read_only: meta.policy.read_only,
           toolchain_write: meta.policy.toolchain_write,
-          base: baseSha ? { kind: 'commit', sha: baseSha } : meta.base,
+          base: baseSha ? { kind: 'commit', sha: baseSha } : { kind: meta.base.kind, ...(meta.base.ref ? { ref: meta.base.ref } : {}) },
           timeouts: overrides.timeouts
             ? { ...source.timeouts, ...(overrides.timeouts as Record<string, unknown>) }
             : source.timeouts,
           degrade: overrides.degrade ?? meta.placement.degrade,
+          critical: overrides.critical ?? meta.critical,
+          priority: overrides.priority ?? meta.priority,
+          depends_on: overrides.depends_on ?? meta.depends_on,
+          fallbacks: overrides.fallbacks ?? meta.placement.fallbacks,
+          waivers: overrides.waivers ?? meta.waivers,
+          budget: overrides.budget ?? null,
         };
         const check = validateRunSpec({ spec: newSpec, pathPrefix: 'overrides', taskLevel: task.level, project, runners: config.runners });
         if (check.violations.length > 0) {
@@ -2304,6 +2320,7 @@ export function createApiServer(config: ServerConfig): ApiServer {
   return {
     server,
     async listen(port = config.port ?? 0, host = config.host ?? '127.0.0.1') {
+      await recoverStartPreparations(runtime);
       await recoverWorktreeReleases({ store, projectMap });
       return new Promise((resolvePromise, rejectPromise) => {
         server.once('error', rejectPromise);

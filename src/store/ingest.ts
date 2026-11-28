@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { buildModelAndEffortRecords } from '../core/model-records.js';
+import type { RunMetadata } from '../api/types.js';
 import { applyEvent } from '../core/reducer.js';
 import type { Run, RunnerEvent } from '../core/types.js';
 import { Store } from './database.js';
@@ -59,7 +61,19 @@ export function ingest(store: Store, runId: string, path: string, now = Date.now
           if (e.type === 'usage' || e.type === 'run.finished') {
             run.version++; store.emit('run.usage', { usage: run.usage, version: run.version }, run, now);
           }
-          if (reduce === applyEvent && (e.type === 'session.started' || e.type === 'run.finished')) {
+          if (reduce === applyEvent && (e.type === 'session.started' || e.type === 'run.finished' || e.type === 'model.changed')) {
+            const hasReport = (e.data.model && typeof e.data.model === 'object') || (e.data.reasoning_effort && typeof e.data.reasoning_effort === 'object');
+            if (hasReport) {
+              const hasApi = store.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='api_runs'").get();
+              const row = hasApi ? store.db.prepare('SELECT payload FROM api_runs WHERE id=?').get(run.id) as { payload: string } | undefined : undefined;
+              const meta = row ? JSON.parse(row.payload) as RunMetadata : {
+                model_record: { requested: run.model, resolved: run.model, effective: null, effective_source: 'unknown', mismatch: false },
+                effort_record: { requested: run.reasoningEffort, resolved_native: null, effective: null, effective_source: 'unknown', mismatch: false },
+              } as RunMetadata;
+              const records = buildModelAndEffortRecords(run, meta);
+              run.version++;
+              store.emit('run.model_effective', { model: records.model_record, reasoning_effort: records.effort_record, mismatch: records.model_record.mismatch || records.effort_record.mismatch, version: run.version }, run, now);
+            }
             const effModel = run.reportedModel?.effective;
             if (typeof effModel === 'string' && effModel !== run.model && !(run.modelAliases ?? []).includes(effModel) && !run.modelMismatchAlerted) {
               run.modelMismatchAlerted = true;

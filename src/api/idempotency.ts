@@ -155,6 +155,12 @@ export class IdempotencyManager {
     });
   }
 
+  completedResponse(scope: IdempotencyScope): { statusCode: number; body: string } | null {
+    const row = this.store.db.prepare("SELECT status_code, response_body FROM api_idempotency WHERE principal=? AND method=? AND path=? AND idempotency_key=? AND status='completed'")
+      .get(scope.principal, scope.method, scope.path, scope.key) as { status_code: number; response_body: string } | undefined;
+    return row ? { statusCode: row.status_code, body: row.response_body } : null;
+  }
+
   /** Must be called inside an active store.transaction(...)! */
   completeInTransaction(scope: IdempotencyScope, statusCode: number, responseBody: string, now = Date.now(), projectId: string | null = null): void {
     this.store.db
